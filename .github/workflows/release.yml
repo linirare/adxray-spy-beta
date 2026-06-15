@@ -65,12 +65,17 @@ jobs:
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: true
-          body: |
-            Public unsigned beta for Windows 10/11 x64.
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $body = @'
+Public unsigned beta for Windows 10/11 x64.
 
-            Windows SmartScreen may warn because this beta is not code-signed.
-            Verify downloads with SHA256SUMS.txt before running.
-          files: dist/release/*
+Windows SmartScreen may warn because this beta is not code-signed.
+Verify downloads with SHA256SUMS.txt before running.
+'@
+          gh release create $tag dist/release/* --prerelease --title $tag --notes $body 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Release exists, updating..."
+            gh release upload $tag dist/release/* --clobber
+          }
