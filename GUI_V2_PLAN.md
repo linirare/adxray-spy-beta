@@ -98,3 +98,41 @@
 - [ ] 调整窗口 → 关闭 → 重开 → 大小恢复
 - [ ] 原有功能不变（检查登录、重新登录、清除登录、诊断导出、进度条、版本检查）
 - [ ] 所有 UI 更新线程安全
+
+---
+
+## 五、多产品汇总 Excel
+
+> 批量提取多个游戏时，除了每个游戏独立的 Excel，额外生成一个合并汇总 Excel。
+
+### 数据结构
+
+```
+输出目录/
+├── 原神_20260615_120000/
+│   ├── report.txt
+│   └── report.xlsx
+├── 王者荣耀_20260615_120001/
+│   ├── report.txt
+│   └── report.xlsx
+└── 批量汇总_20260615_120000.xlsx   ← 新增
+```
+
+### 改动
+
+**`adxray_spy_core.py`** — 新增 `@staticmethod generate_merged_excel(all_results, output_path)`
+
+Sheet 结构：
+- **汇总** — 每个游戏一行：游戏名 | ID | 总体状态 | 总素材数 | 总计划数 | 投放周期 | 渠道数 | 文案数 | 输出目录
+- **{游戏名}** — 每个游戏独立 sheet（截断 ≤31 字符），结构与现有 `generate_excel` 一致（8个工作表）
+
+**`adxray_spy_gui.py`** — 修改 `_start_extract`：
+- 循环内收集 `all_game_data`
+- 循环结束后若 `len > 1`，调用 `generate_merged_excel`
+- 保存到输出根目录，文件名 `批量汇总_{时间戳}.xlsx`
+
+### 规则
+
+- 单游戏提取不生成汇总文件
+- 不删除原有 per-game 独立目录和文件
+- 游戏名含特殊字符时 sheet 名自动清理
