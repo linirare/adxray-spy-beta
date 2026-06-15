@@ -272,6 +272,7 @@ class ADXRaySpyGUI:
         def task():
             self._log("正在打开浏览器，请在浏览器中完成 ADXRay 登录。")
             ensure_playwright_browsers()
+            ADXRaySpy.clear_login_state(self.session_name)
             spy = self._new_spy()
             spy.launch(headless=False)
             ok = spy.wait_for_login()
@@ -283,6 +284,7 @@ class ADXRaySpyGUI:
 
     def _clear_login(self):
         try:
+            self._close_spy()
             ADXRaySpy.clear_login_state(self.session_name)
             self._set_login_status(False, "（本地登录状态已清除）")
             self._log("已清除本机保存的 ADXRay 登录状态。")

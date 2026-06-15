@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 ADXRAY_URL = "https://adxray.dataeye.com/index/home#/Product"
 SESSION_DIR = Path.home() / ".adxray_spy" / "browser_data"
 OUTPUT_DIR = Path.cwd() / "output"
-APP_VERSION = "1.1.0-beta.1"
+APP_VERSION = "1.1.0-beta.2.2"
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 SECRET_PATTERNS = [
@@ -259,51 +259,84 @@ class ADXRaySpy:
         if session_dir.exists():
             shutil.rmtree(session_dir)
 
+    def _is_login_page(self):
+        """检查当前页面是否是 ADXRay 登录页（不抛异常）。"""
+        try:
+            url = (self.page.url or "").lower()
+            if any(k in url for k in ("login", "signin", "auth", "passport")):
+                return True
+            pw = self.page.locator("input[type='password']")
+            if pw.count() > 0 and pw.first.is_visible():
+                return True
+            login_btn = self.page.locator("button:has-text('登录')")
+            text_input = self.page.locator("input[type='text']")
+            if login_btn.count() > 0 and login_btn.first.is_visible() and text_input.count() > 0:
+                return True
+            captcha = self.page.locator("img[alt*='验证码'], img[src*='captcha']")
+            if captcha.count() > 0 and captcha.first.is_visible():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _is_dashboard_page(self):
+        """检查当前页面是否是 ADXRay 登录后业务页（不抛异常）。"""
+        try:
+            search = self.page.locator("input[placeholder*='搜索']")
+            if not (search.count() > 0 and search.first.is_visible()):
+                return False
+            body = self._active_panel_text()
+            if len(body) <= 200:
+                return False
+            keywords = ["素材数", "总计划", "投放", "趋势"]
+            if sum(1 for k in keywords if k in body) >= 2:
+                return True
+        except Exception:
+            pass
+        return False
+
     def is_logged_in(self, navigate=True):
-        """判断 ADXRay 是否已登录"""
+        """判断 ADXRay 是否已登录。最多等待 ~15 秒让 SPA 完成 auth 跳转。"""
         try:
             if navigate:
                 self._goto(ADXRAY_URL)
-                self.page.wait_for_timeout(3000)
-
-            body = self._active_panel_text()
-
-            # 否定检测：密码输入框存在 → 登录页（最可靠指标）
-            password_input = self.page.locator("input[type='password']")
-            if password_input.count() > 0 and password_input.first.is_visible():
-                return False
-            if "登录" in body and ("密码" in body or "验证码" in body):
-                return False
-            if "记住密码" in body or "忘记密码" in body:
-                return False
-
-            # 肯定检测 1: 搜索框（登录后产品页才有）
-            search = self.page.locator("input[placeholder*='搜索']")
-            if search.count() > 0 and search.first.is_visible():
-                return True
-
-            # 肯定检测 2: 业务关键词（需至少命中 2 个，排除"产品"等泛词）
-            keywords = ["素材数", "总计划", "投放", "趋势"]
-            match_count = sum(1 for k in keywords if k in body)
-            if match_count >= 2 and len(body) > 200:
-                return True
-
+            for _ in range(15):
+                self.page.wait_for_timeout(1000)
+                if self._is_login_page():
+                    return False
+                if self._is_dashboard_page():
+                    return True
             return False
         except Exception as exc:
             self._diagnostic("login_check", ok=False, error=str(exc))
             return False
 
     def wait_for_login(self, timeout_seconds=300):
-        """等待用户手动登录，不在等待过程中重复刷新页面。"""
+        """等待用户手动登录。检测 URL 跳转或业务元素出现，不依赖 is_logged_in。"""
         print("请在浏览器中登录 ADXRay（你有 5 分钟时间）...")
         if "adxray.dataeye.com" not in (self.page.url or ""):
             self._goto(ADXRAY_URL)
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             self._check_cancelled()
-            if self.is_logged_in(navigate=False):
-                print("登录成功！")
-                return True
+            try:
+                if self.page.is_closed():
+                    print("浏览器窗口已关闭")
+                    return False
+                url = (self.page.url or "").lower()
+                if any(k in url for k in ("login", "signin", "auth", "passport")):
+                    time.sleep(2)
+                    continue
+                pw = self.page.locator("input[type='password']")
+                if pw.count() > 0 and pw.first.is_visible():
+                    time.sleep(2)
+                    continue
+                search = self.page.locator("input[placeholder*='搜索']")
+                if search.count() > 0 and search.first.is_visible():
+                    print("登录成功！")
+                    return True
+            except Exception:
+                pass
             time.sleep(2)
         return False
 

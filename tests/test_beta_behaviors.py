@@ -127,18 +127,38 @@ class BetaBehaviorTests(unittest.TestCase):
         self.assertEqual(spy.page.calls, 3)
 
     def test_login_wait_does_not_refresh_existing_adxray_page(self):
+        """验证 wait_for_login 在已在 ADXRay 页面时不调用 _goto。"""
+        from unittest.mock import MagicMock
+
+        page = MagicMock()
+        page.url = "https://adxray.dataeye.com/index/home#/Product"
+        page.is_closed.return_value = False
+
         spy = ADXRaySpy()
-        spy.page = type("Page", (), {"url": "https://adxray.dataeye.com/login"})()
-        calls = []
+        spy.page = page
+        spy._goto = MagicMock()
 
-        def is_logged_in(navigate=True):
-            calls.append(navigate)
-            return len(calls) == 2
+        # 让 password locator 返回 count=0（无密码框）
+        pw_loc = MagicMock()
+        pw_loc.count.return_value = 0
+        # 前两次 search locator 返回 count=1 但 visible=False，之后 visible=True
+        search_loc = MagicMock()
+        search_loc.count.return_value = 1
+        search_loc.first.is_visible.side_effect = [False, False, True]
 
-        spy.is_logged_in = is_logged_in
+        def fake_locator(sel):
+            if "type='password'" in sel:
+                return pw_loc
+            if "placeholder*='搜索'" in sel:
+                return search_loc
+            return MagicMock()
+
+        page.locator.side_effect = fake_locator
+
         with patch("adxray_spy_core.time.sleep"):
-            self.assertTrue(spy.wait_for_login(timeout_seconds=5))
-        self.assertEqual(calls, [False, False])
+            ok = spy.wait_for_login(timeout_seconds=10)
+        self.assertTrue(ok)
+        spy._goto.assert_not_called()
 
     def test_extract_all_marks_missing_modules_as_partial(self):
         data = FakeSpy().extract_all({"id": "123", "name": "测试", "url": "detail"})
