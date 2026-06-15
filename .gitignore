@@ -1,7 +1,7 @@
 # PyInstaller
 dist/
 build/
-*.spec
+.playwright-browsers/
 
 # Python
 __pycache__/
@@ -15,6 +15,21 @@ __pycache__/
 
 # Output reports
 output/
+debug.log
 
 # Browser data
 .adxray_spy/
+
+# Unrelated project files
+ad_creative_analysis.py
+analyze.py
+collect.py
+config.py
+content_analysis.py
+cross_platform.py
+deep_dive.py
+fb_ad_spy.py
+install_opencv.py
+recommend.py
+run_all.py
+viral_deepdive.py

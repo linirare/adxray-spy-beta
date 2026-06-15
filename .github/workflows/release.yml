@@ -1,0 +1,74 @@
+name: Build Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Install bundled Chromium
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$env:GITHUB_WORKSPACE\.playwright-browsers"
+          python -m playwright install chromium
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build portable app
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$env:GITHUB_WORKSPACE\.playwright-browsers"
+          python -m PyInstaller --clean --noconfirm adxray-spy.spec
+          $process = Start-Process -FilePath "dist\adxray-spy\adxray-spy.exe" -ArgumentList "--smoke-test" -WorkingDirectory $env:RUNNER_TEMP -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed: $($process.ExitCode)" }
+          New-Item -ItemType Directory -Force -Path "dist\release" | Out-Null
+          Compress-Archive -Path "dist\adxray-spy\*" -DestinationPath "dist\release\adxray-spy-portable-win-x64.zip"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "installer\adxray-spy.iss"
+
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem "dist\release" -File | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii "dist\release\SHA256SUMS.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adxray-spy-windows-x64
+          path: dist/release/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          body: |
+            Public unsigned beta for Windows 10/11 x64.
+
+            Windows SmartScreen may warn because this beta is not code-signed.
+            Verify downloads with SHA256SUMS.txt before running.
+          files: dist/release/*

@@ -5,22 +5,97 @@ ADXRay Game Spy - 核心模块
 import os
 import re
 import json
+import sys
+import threading
 import time
+import zipfile
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 
 ADXRAY_URL = "https://adxray.dataeye.com/index/home#/Product"
 SESSION_DIR = Path.home() / ".adxray_spy" / "browser_data"
 OUTPUT_DIR = Path.cwd() / "output"
+APP_VERSION = "1.1.0-beta.1"
+
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+SECRET_PATTERNS = [
+    re.compile(r"(?i)(cookie|authorization|token|password|session)\s*[:=]\s*[^\r\n]+"),
+    re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]+"),
+]
+
+
+class MultipleProductsFound(Exception):
+    """搜索结果不唯一，调用方必须让用户明确选择。"""
+
+    def __init__(self, products):
+        super().__init__(f"找到 {len(products)} 个同名或相似产品，请选择目标产品")
+        self.products = products
+
+
+class ExtractionCancelled(Exception):
+    """用户主动取消抓取。"""
+
+
+def sanitize_filename(value, fallback="adxray-report"):
+    """生成 Windows 可安全使用的文件名。"""
+    cleaned = INVALID_FILENAME_CHARS.sub("_", str(value)).strip().rstrip(". ")
+    return cleaned[:120] or fallback
+
+
+def _redact_text(value):
+    text = str(value)
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub(lambda match: f"{match.group(1)}=[REDACTED]" if match.lastindex else "[REDACTED]", text)
+    return text
+
+
+def _redact_value(value):
+    if isinstance(value, dict):
+        return {key: _redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value
+
+
+def _safe_source_url(url):
+    try:
+        parts = urlsplit(url or "")
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
+    except Exception:
+        return ""
+
+
+def create_diagnostic_bundle(output_path, data=None, logs=None):
+    """创建不包含 Cookie、登录凭据或浏览器配置的诊断包。"""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    status = (data or {}).get("抓取状态", {})
+    payload = {
+        "app_version": APP_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "game": (data or {}).get("游戏名", ""),
+        "game_id": (data or {}).get("游戏ID", ""),
+        "status": status,
+    }
+    payload = _redact_value(payload)
+    log_text = "\n".join(_redact_text(line) for line in (logs or []))
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("diagnostics.json", json.dumps(payload, ensure_ascii=False, indent=2))
+        archive.writestr("app.log", log_text)
+    return str(output_path)
 
 
 def ensure_playwright_browsers():
-    """确保 Playwright Chromium 已安装（进程内安装，避免 PyInstaller subprocess 问题）"""
-    import os, sys
-    from pathlib import Path
+    """优先使用发布包内置 Chromium，源码运行时才按需安装。"""
+    bundled_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    bundled_browsers = bundled_root / "ms-playwright"
+    if bundled_browsers.exists():
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled_browsers)
+        return True
 
-    # 关键：设置 PLAYWRIGHT_BROWSERS_PATH 指向标准路径，
-    # 避免 PyInstaller exe 在临时目录里找浏览器
     user_home = os.environ.get("USERPROFILE", os.environ.get("HOME", ""))
     default_browsers_path = os.path.join(user_home, "AppData", "Local", "ms-playwright")
     browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", default_browsers_path)
@@ -30,10 +105,7 @@ def ensure_playwright_browsers():
 
     # 检测浏览器文件是否真实存在
     browsers_dir = Path(browsers_path)
-    installed = any(
-        (d / "chrome-win" / "chrome.exe").exists()
-        for d in browsers_dir.glob("chromium-*")
-    )
+    installed = any(browsers_dir.glob("chromium-*/chrome-win*/chrome.exe"))
 
     # 标记存在且文件也存在 → OK
     if sentinel.exists() and installed:
@@ -79,13 +151,82 @@ def _install_playwright_chromium():
 
 
 class ADXRaySpy:
-    def __init__(self, session_name="adx"):
+    def __init__(self, session_name="adx", cancel_event=None, progress_callback=None):
         self.session_name = session_name
         self.browser_data_dir = SESSION_DIR / session_name
         self.browser_data_dir.mkdir(parents=True, exist_ok=True)
         self.browser = None
         self.context = None
         self.page = None
+        self.cancel_event = cancel_event or threading.Event()
+        self.progress_callback = progress_callback
+        self.diagnostics = []
+        self.module_errors = {}
+
+    def _diagnostic(self, event, **details):
+        if not hasattr(self, "diagnostics"):
+            self.diagnostics = []
+        self.diagnostics.append({
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            **_redact_value(details),
+        })
+
+    def _progress(self, current, total, message):
+        print(message)
+        callback = getattr(self, "progress_callback", None)
+        if callback:
+            callback(current, total, message)
+
+    def _module_error(self, module, error):
+        if not hasattr(self, "module_errors"):
+            self.module_errors = {}
+        self.module_errors[module] = str(error)
+        self._diagnostic("extract_module", module=module, ok=False, error=str(error))
+
+    def _check_cancelled(self):
+        if self.cancel_event and self.cancel_event.is_set():
+            raise ExtractionCancelled("用户已取消抓取")
+
+    def _goto(self, url, attempts=3, timeout=30000):
+        """有限重试导航，并记录脱敏诊断信息。"""
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            self._check_cancelled()
+            try:
+                response = self.page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+                self._diagnostic("navigation", url=_safe_source_url(url), attempt=attempt, ok=True)
+                return response
+            except Exception as exc:
+                last_error = exc
+                self._diagnostic(
+                    "navigation",
+                    url=_safe_source_url(url),
+                    attempt=attempt,
+                    ok=False,
+                    error=str(exc),
+                )
+                if attempt < attempts:
+                    time.sleep(attempt)
+        raise RuntimeError(f"页面加载失败，已重试 {attempts} 次: {last_error}") from last_error
+
+    def _active_panel_text(self, fallback=True):
+        """优先读取当前激活内容区，降低整页文本误匹配。"""
+        for selector in (
+            ".ant-tabs-tabpane-active",
+            "[class*='tabpane'][class*='active']",
+            ".ant-tabs-content .ant-tabs-tabpane:not([style*='display: none'])",
+            "main",
+        ):
+            try:
+                element = self.page.locator(selector).first
+                if element.is_visible(timeout=1000):
+                    text = element.inner_text(timeout=3000)
+                    if text.strip():
+                        return text
+            except Exception:
+                continue
+        return self.page.inner_text("body") if fallback else ""
 
     # ----------------------------------------------------------------
     # 浏览器管理
@@ -110,26 +251,22 @@ class ADXRaySpy:
         if hasattr(self, '_pw_ctx') and self._pw_ctx:
             self._pw_ctx.__exit__(None, None, None)
 
-        # 强制清理使用本工具 user_data_dir 的残留 Chrome 进程
-        try:
-            import subprocess
-            dir_str = str(SESSION_DIR).replace("'", "''")
-            subprocess.run(
-                ['wmic', 'process', 'where',
-                 f"name='chrome.exe' and commandline like '%{dir_str}%'",
-                 'delete'],
-                capture_output=True, timeout=10
-            )
-        except Exception:
-            pass
+    @staticmethod
+    def clear_login_state(session_name="adx"):
+        import shutil
 
-    def is_logged_in(self):
+        session_dir = SESSION_DIR / session_name
+        if session_dir.exists():
+            shutil.rmtree(session_dir)
+
+    def is_logged_in(self, navigate=True):
         """判断 ADXRay 是否已登录"""
         try:
-            self.page.goto(ADXRAY_URL, timeout=30000, wait_until="domcontentloaded")
-            self.page.wait_for_timeout(5000)
+            if navigate:
+                self._goto(ADXRAY_URL)
+                self.page.wait_for_timeout(3000)
 
-            body = self.page.inner_text("body")
+            body = self._active_panel_text()
 
             # 否定检测：登录页特征
             if "登录" in body and ("密码" in body or "验证码" in body):
@@ -148,15 +285,19 @@ class ADXRaySpy:
                 return True
 
             return False
-        except Exception:
+        except Exception as exc:
+            self._diagnostic("login_check", ok=False, error=str(exc))
             return False
 
     def wait_for_login(self, timeout_seconds=300):
-        """等待用户手动登录 ADXRay"""
+        """等待用户手动登录，不在等待过程中重复刷新页面。"""
         print("请在浏览器中登录 ADXRay（你有 5 分钟时间）...")
+        if "adxray.dataeye.com" not in (self.page.url or ""):
+            self._goto(ADXRAY_URL)
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            if self.is_logged_in():
+            self._check_cancelled()
+            if self.is_logged_in(navigate=False):
                 print("登录成功！")
                 return True
             time.sleep(2)
@@ -167,7 +308,7 @@ class ADXRaySpy:
     # ----------------------------------------------------------------
     def search_game(self, game_name):
         """搜索游戏，返回匹配结果列表"""
-        self.page.goto(ADXRAY_URL, timeout=30000, wait_until="domcontentloaded")
+        self._goto(ADXRAY_URL)
         self.page.wait_for_timeout(3000)
 
         # 找到搜索输入框
@@ -191,7 +332,7 @@ class ADXRaySpy:
                 more_btn.click()
                 self.page.wait_for_timeout(3000)
                 return self._parse_search_results_page(game_name)
-            elif "狱国" in dd_text or game_name[:2] in dd_text:
+            elif game_name in dd_text or game_name[:2] in dd_text:
                 return self._parse_dropdown_results(game_name)
 
         # 如果下拉没出来，尝试按回车
@@ -219,7 +360,7 @@ class ADXRaySpy:
             for m in re.finditer(r'Product/Detail/(\d+)', html):
                 ids.add(m.group(1))
 
-            for gid in ids:
+            for gid in sorted(ids):
                 results.append({
                     "id": gid,
                     "name": game_name,
@@ -242,7 +383,7 @@ class ADXRaySpy:
         results = []
         try:
             self.page.wait_for_timeout(2000)
-            body = self.page.inner_text("body")
+            body = self._active_panel_text()
             # 每个游戏产品块的特征
             blocks = self.page.locator("a[href*='Product/Detail']").all()
             seen = set()
@@ -279,8 +420,8 @@ class ADXRaySpy:
         """从页面文本补充产品信息"""
         return product
 
-    def get_product_from_search(self, game_name):
-        """搜索并返回最佳匹配产品（自动选素材数最多的）"""
+    def get_product_from_search(self, game_name, chooser=None):
+        """搜索产品；多结果时必须由调用方明确选择。"""
         results = self.search_game(game_name)
         if not results:
             return None
@@ -291,15 +432,19 @@ class ADXRaySpy:
         print(f"  找到 {len(results)} 个匹配产品:")
         for i, r in enumerate(results):
             print(f"    [{i}] ID={r['id']}")
-        # 默认选第一个（通常较匹配）
-        return results[0]
+        if chooser is None:
+            raise MultipleProductsFound(results)
+        selected = chooser(results)
+        if selected not in results:
+            raise ValueError("产品选择无效")
+        return selected
 
     # ----------------------------------------------------------------
     # 导航到游戏详情页
     # ----------------------------------------------------------------
     def go_to_game(self, product):
         """导航到游戏详情页"""
-        self.page.goto(product["url"], timeout=30000, wait_until="domcontentloaded")
+        self._goto(product["url"])
         self.page.wait_for_timeout(4000)
 
     # ----------------------------------------------------------------
@@ -393,6 +538,7 @@ class ADXRaySpy:
                         del data[key]
 
         except Exception as e:
+            self._module_error("产品概览", e)
             print(f"  提取概览出错: {e}")
         return data
 
@@ -403,7 +549,7 @@ class ADXRaySpy:
             self._click_tab("媒体/广告位")
             self.page.wait_for_timeout(2000)
 
-            body = self.page.inner_text("body")
+            body = self._active_panel_text()
             lines = [l.strip() for l in body.split("\n") if l.strip()]
 
             # 找到"投放素材分布"区域
@@ -434,6 +580,7 @@ class ADXRaySpy:
                         data["媒体"].append(line)
 
         except Exception as e:
+            self._module_error("渠道分布", e)
             print(f"  提取渠道出错: {e}")
         return data
 
@@ -453,7 +600,7 @@ class ADXRaySpy:
             self._click_tab("热门文案")
             self.page.wait_for_timeout(3000)
 
-            body = self.page.inner_text("body")
+            body = self._active_panel_text()
             lines = [l.strip() for l in body.split("\n") if l.strip()]
 
             # 启发式匹配：中文/中文标点开头 + 长度 > 8 + 附近行有数字
@@ -486,6 +633,7 @@ class ADXRaySpy:
             print(f"  提取到 {len(data)} 条热门文案")
 
         except Exception as e:
+            self._module_error("热门文案", e)
             print(f"  提取热门文案出错: {e}")
         return data
 
@@ -505,7 +653,7 @@ class ADXRaySpy:
             self.page.evaluate("window.scrollTo(0, 0)")
             self.page.wait_for_timeout(1000)
 
-            body = self.page.inner_text("body")
+            body = self._active_panel_text()
             dbg = body[:300].replace("\n", " | ")
             print(f"  素材筛选页 body ({len(body)} chars): {dbg}...")
 
@@ -516,7 +664,7 @@ class ADXRaySpy:
                 self.page.wait_for_timeout(5000)
                 self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 self.page.wait_for_timeout(2000)
-                body = self.page.inner_text("body")
+                body = self._active_panel_text()
                 dbg = body[:300].replace("\n", " | ")
                 print(f"  重试后 body ({len(body)} chars): {dbg}...")
 
@@ -595,6 +743,7 @@ class ADXRaySpy:
                   + (f", 代表文案={len(data['代表文案'])}条" if data["代表文案"] else ""))
 
         except Exception as e:
+            self._module_error("素材创意", e)
             print(f"  提取素材创意出错: {e}")
         return data
 
@@ -605,7 +754,7 @@ class ADXRaySpy:
             self._click_tab("达人营销分析")
             self.page.wait_for_timeout(3000)
 
-            body = self.page.inner_text("body")
+            body = self._active_panel_text()
             for key in ["达人视频总数", "视频合作达人", "TOP100达人平均粉丝"]:
                 m = re.search(rf'{re.escape(key)}[：:]*\s*([\d,]+)', body)
                 if m:
@@ -617,6 +766,7 @@ class ADXRaySpy:
             val = data.get("达人视频总数", "0")
             print(f"  达人视频: {val} 条")
         except Exception as e:
+            self._module_error("达人营销", e)
             print(f"  提取达人营销出错: {e}")
         return data
 
@@ -632,15 +782,77 @@ class ADXRaySpy:
                     break
             self.page.wait_for_timeout(2000)
 
-            body = self.page.inner_text("body")
+            body = self._active_panel_text()
             # 找时间范围
             m = re.search(r'(\d{4}-\d{2}-\d{2})\s*[-–]\s*(\d{4}-\d{2}-\d{2})', body)
             if m:
                 data["时间范围"] = f"{m.group(1)} ~ {m.group(2)}"
             data["提示"] = "趋势数据以图表形式展示，详细日数据可在 ADXRay 页面导出 Excel"
         except Exception as e:
+            self._module_error("投放趋势", e)
             print(f"  提取投放趋势出错: {e}")
         return data
+
+    def extract_media_links(self):
+        """提取页面可见的素材链接，不下载图片或视频文件。"""
+        links = []
+        seen = set()
+        try:
+            elements = self.page.locator("a[href], img[src], video[src], source[src]").all()
+            for element in elements[:1000]:
+                try:
+                    tag = element.evaluate("el => el.tagName.toLowerCase()")
+                    url = element.get_attribute("href") or element.get_attribute("src") or ""
+                    if not url or url.startswith(("data:", "javascript:", "#")) or url in seen:
+                        continue
+                    seen.add(url)
+                    kind = "link"
+                    if tag == "img":
+                        kind = "image"
+                    elif tag in ("video", "source"):
+                        kind = "video"
+                    links.append({
+                        "类型": kind,
+                        "链接": url,
+                        "文本": (element.get_attribute("alt") or element.get_attribute("title") or "")[:200],
+                        "来源页面": _safe_source_url(self.page.url),
+                    })
+                except Exception:
+                    continue
+        except Exception as exc:
+            self._diagnostic("media_links", ok=False, error=str(exc))
+        return links
+
+    @staticmethod
+    def _has_content(value):
+        if isinstance(value, dict):
+            return any(ADXRaySpy._has_content(item) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(ADXRaySpy._has_content(item) for item in value)
+        return value not in (None, "")
+
+    def _module_status(self, module, data, required_fields=(), error=""):
+        missing = [field for field in required_fields if not data.get(field)]
+        if not self._has_content(data):
+            status = "失败"
+            error = error or "未提取到可用数据，页面可能未加载或结构已变化"
+        elif error or missing:
+            status = "部分成功"
+            details = []
+            if error:
+                details.append(error)
+            if missing:
+                details.append(f"缺少关键字段: {', '.join(missing)}")
+            error = "；".join(details)
+        else:
+            status = "成功"
+        return {
+            "模块": module,
+            "状态": status,
+            "错误": error,
+            "来源页面": _safe_source_url(getattr(self.page, "url", "")),
+            "抓取时间": datetime.now().isoformat(timespec="seconds"),
+        }
 
     # ----------------------------------------------------------------
     # 分析辅助
@@ -693,25 +905,68 @@ class ADXRaySpy:
         """单个产品的完整数据提取"""
         self.go_to_game(product)
         print(f"  提取数据 (ID={product['id']})...")
-        overview = self.extract_overview()
-        channels = self.extract_channels()
-        hot_copy = self.extract_hot_copy()
-        creatives = self.extract_creatives()
-        influencer = self.extract_influencer()
-        trends = self.extract_trends()
-        channels_data = channels
+        module_specs = [
+            ("产品概览", "概览", self.extract_overview, ("总素材数", "总计划数")),
+            ("渠道分布", "渠道分布", self.extract_channels, ()),
+            ("热门文案", "热门文案", self.extract_hot_copy, ()),
+            ("素材创意", "素材创意", self.extract_creatives, ()),
+            ("达人营销", "达人营销", self.extract_influencer, ()),
+            ("投放趋势", "投放趋势", self.extract_trends, ()),
+            ("素材链接", "素材链接", self.extract_media_links, ()),
+        ]
+        result = {}
+        statuses = []
+        all_links = []
+        for index, (module, key, extractor, required) in enumerate(module_specs, 1):
+            self._check_cancelled()
+            self._progress(index, len(module_specs), f"  [{index}/{len(module_specs)}] 正在提取: {module}")
+            if not hasattr(self, "module_errors"):
+                self.module_errors = {}
+            self.module_errors.pop(module, None)
+            error = ""
+            try:
+                value = extractor()
+                error = self.module_errors.pop(module, "")
+            except ExtractionCancelled:
+                raise
+            except Exception as exc:
+                value = {} if key not in ("热门文案", "素材链接") else []
+                error = str(exc)
+                self._diagnostic("extract_module", module=module, ok=False, error=error)
+            result[key] = value
+            statuses.append(self._module_status(module, value, required, error))
+            if key != "素材链接":
+                try:
+                    all_links.extend(self.extract_media_links())
+                except Exception:
+                    pass
+
+        all_links.extend(result.get("素材链接", []))
+        deduped_links = {}
+        for item in all_links:
+            if item.get("链接"):
+                deduped_links[item["链接"]] = item
+        result["素材链接"] = list(deduped_links.values())
+        statuses[-1] = self._module_status("素材链接", result["素材链接"])
+
+        channels_data = result["渠道分布"]
         if channels_data.get("媒体"):
             channels_data["归类"] = self.categorize_channels(channels_data["媒体"])
-        copy_patterns = self.classify_copy_patterns(hot_copy) if hot_copy else {}
-        return {
-            "概览": overview,
-            "渠道分布": channels_data,
-            "热门文案": hot_copy,
-            "文案分类": copy_patterns,
-            "素材创意": creatives,
-            "达人营销": influencer,
-            "投放趋势": trends,
+        result["文案分类"] = self.classify_copy_patterns(result["热门文案"]) if result["热门文案"] else {}
+
+        if statuses[0]["状态"] == "失败":
+            overall = "失败"
+        elif any(item["状态"] != "成功" for item in statuses):
+            overall = "部分成功"
+        else:
+            overall = "成功"
+        result["抓取状态"] = {
+            "总体状态": overall,
+            "模块": statuses,
+            "来源页面": _safe_source_url(getattr(self.page, "url", "")),
+            "抓取时间": datetime.now().isoformat(timespec="seconds"),
         }
+        return result
 
     # ----------------------------------------------------------------
     # 提取所有数据
@@ -746,11 +1001,11 @@ class ADXRaySpy:
     # ----------------------------------------------------------------
     def generate_report(self, data, output_path=None):
         """生成文本报告"""
-        if output_path is None:
-            output_dir = OUTPUT_DIR
+        if output_path is None or Path(output_path).suffix.lower() != ".txt":
+            output_dir = Path(output_path) if output_path else OUTPUT_DIR
             output_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = output_dir / f"{data['游戏名']}_{ts}_report.txt"
+            output_path = output_dir / f"{sanitize_filename(data['游戏名'])}_{ts}_report.txt"
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         ov = data.get("概览", {})
@@ -760,6 +1015,8 @@ class ADXRaySpy:
         cr = data.get("素材创意", {})
         inf = data.get("达人营销", {})
         tr = data.get("投放趋势", {})
+        status = data.get("抓取状态", {})
+        media_links = data.get("素材链接", [])
 
         lines = []
         def p(text=""):
@@ -768,6 +1025,7 @@ class ADXRaySpy:
         p("=" * 65)
         p(f"  ADXRay 广告投放数据报告")
         p(f"  游戏: {data['游戏名']}")
+        p(f"  抓取状态: {status.get('总体状态', '未知')}")
         p(f"  生成时间: {now}")
         p(f"  数据来源: adxray.dataeye.com")
         p("=" * 65)
@@ -902,11 +1160,24 @@ class ADXRaySpy:
         if tr.get("提示"):
             p(f"  {tr['提示']}")
 
-        # ── 七、说明 ──
+        # ── 七、素材链接 ──
         p(f"""
 {'─' * 65}
-  七、说明
+  七、素材链接 ({len(media_links)})
+{'─' * 65}""")
+        for item in media_links[:100]:
+            p(f"  [{item.get('类型', 'link')}] {item.get('链接', '')}")
+
+        # ── 八、抓取状态与说明 ──
+        p(f"""
 {'─' * 65}
+  八、抓取状态与说明
+{'─' * 65}
+  总体状态: {status.get('总体状态', '未知')}""")
+        for item in status.get("模块", []):
+            detail = f" - {item.get('错误')}" if item.get("错误") else ""
+            p(f"  {item.get('模块')}: {item.get('状态')}{detail}")
+        p(f"""
   数据来源: ADXRay (dataeye.com)
   采集时间: {now}
   注: 投放消耗/曝光预估数据可通过 ADXRay 页面导出 Excel 获取详
@@ -915,16 +1186,114 @@ class ADXRaySpy:
 
         report_text = "\n".join(lines)
         output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(report_text, encoding="utf-8")
         print(f"\n报告已保存: {output_path}")
         return str(output_path)
+
+    def generate_excel(self, data, output_path):
+        """将抓取结果写入固定工作表结构的 Excel。"""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+
+        def sheet(name, headers):
+            ws = workbook.create_sheet(name)
+            ws.append(headers)
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+            ws.freeze_panes = "A2"
+            return ws
+
+        status_ws = sheet("抓取状态", ["模块", "状态", "错误", "来源页面", "抓取时间"])
+        status = data.get("抓取状态", {})
+        status_ws.append(["总体", status.get("总体状态", "未知"), "", status.get("来源页面", ""), status.get("抓取时间", "")])
+        for item in status.get("模块", []):
+            status_ws.append([item.get(key, "") for key in ("模块", "状态", "错误", "来源页面", "抓取时间")])
+
+        overview_ws = sheet("产品概览", ["字段", "值"])
+        for key, value in data.get("概览", {}).items():
+            overview_ws.append([key, "、".join(value) if isinstance(value, list) else value])
+
+        channels_ws = sheet("渠道分布", ["类型", "名称", "归类"])
+        channels = data.get("渠道分布", {})
+        group_by_media = {}
+        for group, members in channels.get("归类", {}).items():
+            for member in members:
+                group_by_media[member] = group
+        for media in channels.get("媒体", []):
+            channels_ws.append(["媒体", media, group_by_media.get(media, "")])
+        for placement in channels.get("广告位", []):
+            channels_ws.append(["广告位", placement, ""])
+
+        copy_ws = sheet("热门文案", ["排名", "文案", "对应素材数", "使用天数", "产品使用数"])
+        for index, item in enumerate(data.get("热门文案", []), 1):
+            copy_ws.append([index, item.get("文案", ""), item.get("对应素材数", ""), item.get("使用天数", ""), item.get("产品使用数", "")])
+
+        creative_ws = sheet("素材创意", ["分类", "名称", "值"])
+        creatives = data.get("素材创意", {})
+        for category in ("类型分布", "尺寸分布", "广告形式"):
+            for key, value in creatives.get(category, {}).items():
+                creative_ws.append([category, key, value])
+        for text in creatives.get("代表文案", []):
+            creative_ws.append(["代表文案", text, ""])
+        for row in creatives.get("素材列表", []):
+            creative_ws.append(["素材列表", " | ".join(row), ""])
+
+        influencer_ws = sheet("达人营销", ["字段", "值"])
+        for key, value in data.get("达人营销", {}).items():
+            influencer_ws.append([key, value])
+
+        trends_ws = sheet("投放趋势", ["字段", "值"])
+        for key, value in data.get("投放趋势", {}).items():
+            trends_ws.append([key, value])
+
+        links_ws = sheet("素材链接", ["类型", "链接", "文本", "来源页面"])
+        for item in data.get("素材链接", []):
+            links_ws.append([item.get(key, "") for key in ("类型", "链接", "文本", "来源页面")])
+
+        for ws in workbook.worksheets:
+            for column in ws.columns:
+                max_length = max((len(str(cell.value or "")) for cell in column), default=10)
+                ws.column_dimensions[column[0].column_letter].width = min(max(max_length + 2, 12), 60)
+        workbook.save(output_path)
+        print(f"Excel 已保存: {output_path}")
+        return str(output_path)
+
+    def export_bundle(self, data, output_root=None):
+        """为一个游戏创建独立目录，并输出文本报告与 Excel。"""
+        output_root = Path(output_root or OUTPUT_DIR)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        game_dir = output_root / f"{sanitize_filename(data.get('游戏名', 'game'))}_{timestamp}"
+        game_dir.mkdir(parents=True, exist_ok=True)
+        report = self.generate_report(data, game_dir / "report.txt")
+        excel = self.generate_excel(data, game_dir / "report.xlsx")
+        return {"directory": str(game_dir), "report": report, "excel": excel}
 
 
 # ----------------------------------------------------------------
 # 快捷入口
 # ----------------------------------------------------------------
-def run(game_name: str, session_name="adx", output_dir=None) -> str:
-    """完整流程：搜索 -> 提取 -> 报告 -> 返回报告路径"""
+def _choose_product_cli(products):
+    for index, product in enumerate(products, 1):
+        print(f"  [{index}] {product.get('name', '')} (ID={product.get('id', '?')})")
+    while True:
+        raw = input("请选择产品编号，或输入 q 取消: ").strip().lower()
+        if raw == "q":
+            raise ExtractionCancelled("用户取消产品选择")
+        try:
+            selected = int(raw) - 1
+            return products[selected]
+        except (ValueError, IndexError):
+            print("选择无效，请重试")
+
+
+def run(game_name: str, session_name="adx", output_dir=None):
+    """完整流程：搜索 -> 提取 -> 文本报告和 Excel。"""
     ensure_playwright_browsers()
     spy = ADXRaySpy(session_name)
     try:
@@ -941,7 +1310,7 @@ def run(game_name: str, session_name="adx", output_dir=None) -> str:
                 raise Exception("登录超时，请重试")
 
         # 搜索游戏
-        product = spy.get_product_from_search(game_name)
+        product = spy.get_product_from_search(game_name, chooser=_choose_product_cli)
         if not product:
             raise Exception(f"未找到游戏: {game_name}")
 
@@ -950,9 +1319,7 @@ def run(game_name: str, session_name="adx", output_dir=None) -> str:
         # 提取数据
         data = spy.extract_all(product)
 
-        # 生成报告
-        output_path = spy.generate_report(data, output_dir)
-        return output_path
+        return spy.export_bundle(data, output_dir)
 
     finally:
         spy.close()
@@ -964,7 +1331,7 @@ def main_cli():
     import argparse
 
     parser = argparse.ArgumentParser(description="ADXRay Game Spy - 广告投放数据提取")
-    parser.add_argument("game", nargs="?", default="狱国争霸", help="游戏名称")
+    parser.add_argument("game", help="游戏名称")
     parser.add_argument("--output", "-o", default=None, help="输出目录")
     parser.add_argument("--session", "-s", default="adx", help="session 名称")
     parser.add_argument("--login", action="store_true", help="强制重新登录")
@@ -973,11 +1340,8 @@ def main_cli():
 
     # 清除 session 重新登录
     if args.login:
-        import shutil
-        session_dir = SESSION_DIR / args.session
-        if session_dir.exists():
-            shutil.rmtree(session_dir)
-            print("已清除登录状态")
+        ADXRaySpy.clear_login_state(args.session)
+        print("已清除登录状态")
 
     run(args.game, args.session, args.output)
 

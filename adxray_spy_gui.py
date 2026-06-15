@@ -1,308 +1,425 @@
-"""
-ADXRay Game Spy - 图形界面 (Tkinter)
-小白用户友好，双击运行
-"""
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import threading
+"""ADXRay Game Spy - 公开 Beta 图形界面。"""
+import json
+import queue
+import re
 import sys
-import os
-from pathlib import Path
+import threading
+import urllib.request
+import webbrowser
 from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 sys.path.insert(0, str(Path(__file__).parent))
-from adxray_spy_core import ADXRaySpy, ensure_playwright_browsers
+from adxray_spy_core import (  # noqa: E402
+    APP_VERSION,
+    ADXRaySpy,
+    ExtractionCancelled,
+    create_diagnostic_bundle,
+    ensure_playwright_browsers,
+)
+
+RELEASE_API = "https://api.github.com/repos/linirare/adxray-spy/releases?per_page=1"
+
+
+def version_key(value):
+    """将公开版本标签转换为可比较元组，稳定版高于同号 Beta。"""
+    value = str(value).lower().lstrip("v")
+    main, separator, prerelease = value.partition("-")
+    numbers = [int(item) for item in re.findall(r"\d+", main)[:3]]
+    numbers.extend([0] * (3 - len(numbers)))
+    stable_rank = 1 if not separator else 0
+    prerelease_number = int(re.findall(r"\d+", prerelease)[-1]) if re.findall(r"\d+", prerelease) else 0
+    return (*numbers, stable_rank, prerelease_number)
 
 
 class RedirectText:
-    def __init__(self, text_widget):
-        self.text_widget = text_widget
+    """将 print 输出送入线程安全日志队列。"""
 
-    def write(self, string):
-        self.text_widget.insert(tk.END, string)
-        self.text_widget.see(tk.END)
-        self.text_widget.update()
+    def __init__(self, emit):
+        self.emit = emit
+        self.buffer = ""
+        self.lock = threading.Lock()
+
+    def write(self, text):
+        if not text:
+            return
+        with self.lock:
+            self.buffer += text
+            while "\n" in self.buffer:
+                line, self.buffer = self.buffer.split("\n", 1)
+                self.emit(line, timestamp=False)
 
     def flush(self):
-        pass
+        with self.lock:
+            if self.buffer:
+                self.emit(self.buffer, timestamp=False)
+                self.buffer = ""
 
 
 class ADXRaySpyGUI:
     def __init__(self):
         self.window = tk.Tk()
-        self.window.title("ADXRay Game Spy v1.0")
-        self.window.geometry("680x580")
-        self.window.resizable(False, False)
+        self.window.title(f"ADXRay Game Spy {APP_VERSION}")
+        self.window.geometry("760x720")
+        self.window.minsize(720, 650)
 
-        self.window.update_idletasks()
-        x = (self.window.winfo_screenwidth() - 680) // 2
-        y = (self.window.winfo_screenheight() - 580) // 2
-        self.window.geometry(f"+{x}+{y}")
-
-        self.session_name = "adx"
+        self.ui_queue = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.worker = None
         self.spy = None
-        self.login_status = False
+        self.logs = []
+        self.last_data = None
+        self.last_diagnostics = []
         self.output_dir = str(Path.cwd() / "output")
+        self.session_name = "adx"
 
         self._build_ui()
+        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.window.after(50, self._drain_ui_queue)
+        self.window.after(1500, self._check_updates_async)
+        self._log("Ready. 发布版内置 Chromium；所有登录数据仅保存在本机。")
 
     def _build_ui(self):
-        title = tk.Label(self.window, text="ADXRay Game Spy",
-                         font=("Microsoft YaHei", 16, "bold"), fg="#1a73e8")
-        title.pack(pady=(15, 5))
-        subtitle = tk.Label(self.window,
-                            text="Enter game name -> auto extract ADXRay ad data",
-                            font=("Microsoft YaHei", 9), fg="#666")
-        subtitle.pack(pady=(0, 15))
+        header = ttk.Frame(self.window, padding=(20, 15, 20, 5))
+        header.pack(fill="x")
+        ttk.Label(header, text="ADXRay Game Spy", font=("Microsoft YaHei", 17, "bold")).pack(side="left")
+        ttk.Label(header, text=APP_VERSION, foreground="#777").pack(side="right")
+        ttk.Label(
+            self.window,
+            text="输入游戏名，自动提取 ADXRay 可见投放数据、素材链接，并生成文本报告与 Excel",
+            foreground="#555",
+        ).pack(anchor="w", padx=22, pady=(0, 12))
 
-        frame = ttk.Frame(self.window, padding=10)
-        frame.pack(fill="x", padx=20)
-
-        ttk.Label(frame, text="Game:", font=("Microsoft YaHei", 10)).grid(
-            row=0, column=0, sticky="w", pady=5)
-        self.game_entry = ttk.Entry(frame, font=("Microsoft YaHei", 11), width=40)
-        self.game_entry.grid(row=0, column=1, sticky="ew", pady=5, padx=(5, 0))
+        form = ttk.Frame(self.window, padding=(20, 5))
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        ttk.Label(form, text="游戏名称").grid(row=0, column=0, sticky="w", pady=5)
+        self.game_entry = ttk.Entry(form, font=("Microsoft YaHei", 10))
+        self.game_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
         self.game_entry.focus()
 
-        ttk.Label(frame, text="Output:", font=("Microsoft YaHei", 10)).grid(
-            row=1, column=0, sticky="w", pady=5)
+        ttk.Label(form, text="输出目录").grid(row=1, column=0, sticky="w", pady=5)
         self.dir_var = tk.StringVar(value=self.output_dir)
-        dir_entry = ttk.Entry(frame, textvariable=self.dir_var,
-                              font=("Microsoft YaHei", 9), width=30)
-        dir_entry.grid(row=1, column=1, sticky="ew", pady=5, padx=(5, 0))
-        ttk.Button(frame, text="Browse", command=self._browse_dir, width=8).grid(
-            row=1, column=2, padx=(5, 0))
+        ttk.Entry(form, textvariable=self.dir_var).grid(row=1, column=1, sticky="ew", padx=(10, 5), pady=5)
+        self.browse_btn = ttk.Button(form, text="浏览", command=self._browse_dir, width=8)
+        self.browse_btn.grid(row=1, column=2, pady=5)
 
-        self.status_frame = ttk.LabelFrame(self.window, text="Login Status", padding=5)
-        self.status_frame.pack(fill="x", padx=30, pady=10)
+        account = ttk.LabelFrame(self.window, text="ADXRay 登录", padding=8)
+        account.pack(fill="x", padx=20, pady=10)
+        self.status_label = ttk.Label(account, text="尚未检查", foreground="#666")
+        self.status_label.pack(side="left", padx=5)
+        self.clear_login_btn = ttk.Button(account, text="清除登录", command=self._clear_login)
+        self.clear_login_btn.pack(side="right", padx=4)
+        self.relogin_btn = ttk.Button(account, text="重新登录", command=self._re_login)
+        self.relogin_btn.pack(side="right", padx=4)
+        self.check_login_btn = ttk.Button(account, text="检查登录", command=self._check_login)
+        self.check_login_btn.pack(side="right", padx=4)
 
-        status_row = ttk.Frame(self.status_frame)
-        status_row.pack(fill="x")
+        actions = ttk.Frame(self.window, padding=(20, 0))
+        actions.pack(fill="x")
+        self.run_btn = ttk.Button(actions, text="开始提取", command=self._start_extract)
+        self.run_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(actions, text="取消", command=self._cancel, state="disabled")
+        self.cancel_btn.pack(side="left", padx=8)
+        self.diagnostic_btn = ttk.Button(actions, text="导出诊断包", command=self._export_diagnostics, state="disabled")
+        self.diagnostic_btn.pack(side="right")
 
-        self.status_icon = tk.Label(status_row, text="*", fg="#999",
-                                    font=("Microsoft YaHei", 14))
-        self.status_icon.pack(side="left", padx=(5, 5))
-        self.status_label = tk.Label(status_row, text="Not checked", fg="#666",
-                                     font=("Microsoft YaHei", 9))
-        self.status_label.pack(side="left")
+        progress_frame = ttk.Frame(self.window, padding=(20, 10, 20, 0))
+        progress_frame.pack(fill="x")
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
+        self.progress.pack(fill="x")
+        self.progress_label = ttk.Label(progress_frame, text="等待任务", foreground="#666")
+        self.progress_label.pack(anchor="w", pady=(3, 0))
 
-        ttk.Button(status_row, text="Check Login",
-                   command=self._check_login, width=15).pack(side="right", padx=5)
-        ttk.Button(status_row, text="Re-login",
-                   command=self._re_login, width=12).pack(side="right", padx=5)
-
-        self.run_btn = ttk.Button(
-            self.window, text=" Start Extract",
-            command=self._start_extract,
-            style="run.TButton",
-        )
-        self.run_btn.pack(pady=(5, 10))
-        style = ttk.Style()
-        style.configure("run.TButton", font=("Microsoft YaHei", 12, "bold"), padding=8)
-
-        log_label = tk.Label(self.window, text="Log", font=("Microsoft YaHei", 9), fg="#666")
-        log_label.pack(anchor="w", padx=30)
-
+        ttk.Label(self.window, text="运行日志", foreground="#666").pack(anchor="w", padx=22, pady=(10, 2))
         self.log_text = scrolledtext.ScrolledText(
-            self.window, height=14, width=80,
-            font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4",
-            state="normal",
+            self.window,
+            font=("Consolas", 9),
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            height=20,
+            state="disabled",
         )
-        self.log_text.pack(fill="both", padx=30, pady=(0, 15), expand=True)
+        self.log_text.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+        sys.stdout = RedirectText(self._log)
 
-        sys.stdout = RedirectText(self.log_text)
+        self.conflict_buttons = [
+            self.run_btn,
+            self.browse_btn,
+            self.check_login_btn,
+            self.relogin_btn,
+            self.clear_login_btn,
+        ]
 
-        bottom = ttk.Frame(self.window)
-        bottom.pack(fill="x", padx=20, pady=(0, 10))
-        tk.Label(
-            bottom,
-            text="Requires ADXRay account | First run auto-downloads Chromium",
-            font=("Microsoft YaHei", 8), fg="#999",
-        ).pack(side="left")
+    def _post_ui(self, callback, *args, **kwargs):
+        self.ui_queue.put((callback, args, kwargs))
 
-        self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                callback, args, kwargs = self.ui_queue.get_nowait()
+                callback(*args, **kwargs)
+        except queue.Empty:
+            pass
+        if self.window.winfo_exists():
+            self.window.after(50, self._drain_ui_queue)
+
+    def _append_log(self, text):
+        self.log_text.config(state="normal")
+        self.log_text.insert(tk.END, text)
+        self.log_text.see(tk.END)
+        self.log_text.config(state="disabled")
+
+    def _log(self, text, timestamp=True):
+        if not text:
+            return
+        rendered = str(text)
+        if timestamp and not rendered.startswith("\n"):
+            rendered = f"[{datetime.now():%H:%M:%S}] {rendered}"
+        if not rendered.endswith("\n"):
+            rendered += "\n"
+        self.logs.extend(line for line in rendered.splitlines() if line)
+        self._post_ui(self._append_log, rendered)
+
+    def _set_busy(self, busy, label="等待任务"):
+        state = "disabled" if busy else "normal"
+        for button in self.conflict_buttons:
+            button.config(state=state)
+        self.cancel_btn.config(state="normal" if busy else "disabled")
+        self.progress_label.config(text=label)
+        if not busy:
+            self.progress_var.set(0)
+
+    def _set_login_status(self, logged_in, message=""):
+        if logged_in:
+            self.status_label.config(text=f"已登录 {message}".strip(), foreground="#268a3a")
+        else:
+            self.status_label.config(text=f"未登录 {message}".strip(), foreground="#c43b3b")
+
+    def _set_progress(self, current, total, message):
+        self.progress_var.set((current / max(total, 1)) * 100)
+        self.progress_label.config(text=message)
+
+    def _start_worker(self, label, target):
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("任务进行中", "请等待当前任务结束，或先点击取消。")
+            return
+        self.cancel_event.clear()
+        self._set_busy(True, label)
+
+        def wrapper():
+            try:
+                target()
+            except ExtractionCancelled as exc:
+                self._log(str(exc))
+                self._post_ui(messagebox.showinfo, "已取消", str(exc))
+            except Exception as exc:
+                self._log(f"任务失败: {exc}")
+                self._post_ui(messagebox.showerror, "任务失败", str(exc))
+            finally:
+                if self.spy:
+                    self.last_diagnostics = list(self.spy.diagnostics)
+                    if self.last_diagnostics and self.last_data is None:
+                        self.last_data = {"游戏名": "", "抓取状态": {"总体状态": "失败", "模块": []}}
+                    if self.last_diagnostics:
+                        self._post_ui(self.diagnostic_btn.config, state="normal")
+                self._close_spy()
+                self._post_ui(self._set_busy, False, "等待任务")
+
+        self.worker = threading.Thread(target=wrapper, daemon=True)
+        self.worker.start()
+
+    def _close_spy(self):
+        spy = self.spy
+        self.spy = None
+        if spy:
+            try:
+                spy.close()
+            except Exception as exc:
+                self._log(f"关闭浏览器时出现问题: {exc}")
+
+    def _new_spy(self, progress_callback=None):
+        self._close_spy()
+        self.spy = ADXRaySpy(
+            self.session_name,
+            cancel_event=self.cancel_event,
+            progress_callback=progress_callback,
+        )
+        return self.spy
 
     def _browse_dir(self):
-        d = filedialog.askdirectory(initialdir=self.output_dir)
-        if d:
-            self.output_dir = d
-            self.dir_var.set(d)
-
-    def _log(self, msg):
-        now = datetime.now().strftime("%H:%M:%S")
-        print(f"[{now}] {msg}")
-
-    def _ensure_browser_closed(self):
-        """安全关闭上一个浏览器，释放 user_data_dir"""
-        old = self.spy
-        self.spy = None
-        if old:
-            try:
-                old.close()
-            except Exception:
-                pass
-        # 强制清理残留进程
-        import subprocess, time
-        try:
-            dir_str = str(Path.home() / ".adxray_spy").replace("'", "''")
-            subprocess.run(
-                ['wmic', 'process', 'where',
-                 f"name='chrome.exe' and commandline like '%{dir_str}%'",
-                 'delete'],
-                capture_output=True, timeout=10
-            )
-        except Exception:
-            pass
-        time.sleep(1.5)
-
-    def _update_status(self, logged_in, msg=""):
-        self.login_status = logged_in
-        if logged_in:
-            self.status_icon.config(text="*", fg="#4caf50")
-            self.status_label.config(text=f"Logged in {msg}", fg="#4caf50")
-        else:
-            self.status_icon.config(text="*", fg="#f44336")
-            self.status_label.config(text=f"Not logged in {msg}", fg="#f44336")
+        selected = filedialog.askdirectory(initialdir=self.dir_var.get() or self.output_dir)
+        if selected:
+            self.output_dir = selected
+            self.dir_var.set(selected)
 
     def _check_login(self):
         def task():
-            self._ensure_browser_closed()
-            self._log("Checking login status...")
-            try:
-                ensure_playwright_browsers()
-                spy = ADXRaySpy(self.session_name)
-                self.spy = spy
-                spy.launch(headless=True)
-                ok = spy.is_logged_in()
-                spy.close()
-                if self.spy is spy:
-                    self.spy = None
-                if ok:
-                    self._update_status(True, "(session valid)")
-                    self._log("Login OK")
-                else:
-                    self._update_status(False)
-                    self._log("Not logged in, click Re-login")
-            except Exception as e:
-                self._update_status(False)
-                self._log(f"Check failed: {e}")
+            self._log("正在检查登录状态...")
+            ensure_playwright_browsers()
+            spy = self._new_spy()
+            spy.launch(headless=True)
+            ok = spy.is_logged_in()
+            self._post_ui(self._set_login_status, ok, "（会话有效）" if ok else "")
+            self._log("登录状态检查完成")
 
-        threading.Thread(target=task, daemon=True).start()
+        self._start_worker("正在检查登录状态", task)
 
     def _re_login(self):
         def task():
-            self._ensure_browser_closed()
-            self._log("Opening browser for login...")
-            self._log("Please log into ADXRay in the browser window")
-            try:
-                ensure_playwright_browsers()
-                spy = ADXRaySpy(self.session_name)
-                self.spy = spy
-                spy.launch(headless=False)
-                ok = spy.wait_for_login()
-                spy.close()
-                if self.spy is spy:
-                    self.spy = None
-                if ok:
-                    self._update_status(True, "(logged in)")
-                    self._log("Login success!")
-                else:
-                    self._update_status(False)
-                    self._log("Login timeout")
-            except Exception as e:
-                self._log(f"Login error: {e}")
+            self._log("正在打开浏览器，请在浏览器中完成 ADXRay 登录。")
+            ensure_playwright_browsers()
+            spy = self._new_spy()
+            spy.launch(headless=False)
+            ok = spy.wait_for_login()
+            self._post_ui(self._set_login_status, ok, "（登录成功）" if ok else "")
+            if not ok:
+                raise RuntimeError("登录超时，请重试")
 
-        threading.Thread(target=task, daemon=True).start()
+        self._start_worker("等待登录", task)
+
+    def _clear_login(self):
+        try:
+            ADXRaySpy.clear_login_state(self.session_name)
+            self._set_login_status(False, "（本地登录状态已清除）")
+            self._log("已清除本机保存的 ADXRay 登录状态。")
+        except Exception as exc:
+            messagebox.showerror("清除失败", str(exc))
+
+    def _choose_product_from_worker(self, products):
+        event = threading.Event()
+        result = {}
+
+        def ask():
+            choices = "\n".join(
+                f"{index}. {item.get('name', '未知产品')} (ID={item.get('id', '?')})"
+                for index, item in enumerate(products, 1)
+            )
+            selected = simpledialog.askinteger(
+                "选择产品",
+                f"找到多个匹配产品，请输入编号：\n\n{choices}",
+                minvalue=1,
+                maxvalue=len(products),
+                parent=self.window,
+            )
+            if selected:
+                result["product"] = products[selected - 1]
+            event.set()
+
+        self._post_ui(ask)
+        while not event.wait(0.1):
+            if self.cancel_event.is_set():
+                raise ExtractionCancelled("用户已取消抓取")
+        if "product" not in result:
+            raise ExtractionCancelled("用户取消了产品选择")
+        return result["product"]
 
     def _start_extract(self):
         raw = self.game_entry.get().strip()
         if not raw:
-            messagebox.showwarning("Hint", "Please enter at least one game name")
+            messagebox.showwarning("提示", "请输入至少一个游戏名称。")
             return
-
-        game_names = [g.strip() for g in raw.replace("，", ",").split(",") if g.strip()]
-        if not game_names:
-            messagebox.showwarning("Hint", "Please enter at least one game name")
-            return
-
-        total = len(game_names)
-        self.run_btn.config(state="disabled", text="Extracting...")
-        self._log(f"\n{'='*50}")
-        self._log(f"Games ({total}): {', '.join(game_names)}")
-        self._log(f"{'='*50}")
+        games = [item.strip() for item in raw.replace("，", ",").split(",") if item.strip()]
+        output_root = self.dir_var.get().strip() or self.output_dir
+        self.last_data = None
+        self.last_diagnostics = []
 
         def task():
+            ensure_playwright_browsers()
+            total_steps = len(games) * 7
+            game_step = {"offset": 0}
+
+            def progress(current, _total, message):
+                self._post_ui(self._set_progress, game_step["offset"] + current, total_steps, message)
+
+            spy = self._new_spy(progress)
+            spy.launch(headless=False)
+            if not spy.is_logged_in():
+                self._log("需要登录 ADXRay，请在浏览器窗口中完成登录。")
+                if not spy.wait_for_login():
+                    raise RuntimeError("登录超时，请重试")
+            self._post_ui(self._set_login_status, True, "")
+
             results = []
+            for game_index, game in enumerate(games):
+                if self.cancel_event.is_set():
+                    raise ExtractionCancelled("用户已取消抓取")
+                game_step["offset"] = game_index * 7
+                self._log(f"\n开始处理: {game}")
+                try:
+                    product = spy.get_product_from_search(game, chooser=self._choose_product_from_worker)
+                    if not product:
+                        results.append((game, "失败", "未找到产品"))
+                        continue
+                    data = spy.extract_all(product)
+                    outputs = spy.export_bundle(data, output_root)
+                    self.last_data = data
+                    status = data.get("抓取状态", {}).get("总体状态", "未知")
+                    results.append((game, status, outputs["directory"]))
+                    self._log(f"{game}: {status}，输出目录: {outputs['directory']}")
+                except ExtractionCancelled:
+                    raise
+                except Exception as exc:
+                    results.append((game, "失败", str(exc)))
+                    self._log(f"{game}: 失败 - {exc}")
+
+            lines = [f"{game}: {status}\n{detail}" for game, status, detail in results]
+            incomplete = [item for item in results if item[1] != "成功"]
+            title = "提取完成" if not incomplete else "提取完成，但存在不完整结果"
+            self._post_ui(self.diagnostic_btn.config, state="normal")
+            self._post_ui(messagebox.showinfo, title, "\n\n".join(lines))
+
+        self._start_worker("正在提取", task)
+
+    def _cancel(self):
+        self.cancel_event.set()
+        self.progress_label.config(text="正在取消...")
+        self._log("已请求取消，当前页面操作结束后将停止。")
+
+    def _export_diagnostics(self):
+        if not self.last_data:
+            messagebox.showwarning("无诊断数据", "请先运行一次抓取任务。")
+            return
+        default = f"adxray-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip"
+        path = filedialog.asksaveasfilename(
+            title="导出诊断包",
+            defaultextension=".zip",
+            initialfile=default,
+            filetypes=[("ZIP archive", "*.zip")],
+        )
+        if not path:
+            return
+        extra_logs = list(self.logs)
+        extra_logs.extend(json.dumps(item, ensure_ascii=False) for item in self.last_diagnostics)
+        create_diagnostic_bundle(path, self.last_data, extra_logs)
+        messagebox.showinfo("导出完成", f"诊断包已保存：\n{path}\n\n诊断包不包含 Cookie 或浏览器登录数据。")
+
+    def _check_updates_async(self):
+        def task():
             try:
-                self._ensure_browser_closed()
-                ensure_playwright_browsers()
-                spy = ADXRaySpy(self.session_name)
-                self.spy = spy
-                spy.launch(headless=False)
+                request = urllib.request.Request(RELEASE_API, headers={"User-Agent": f"ADXRay-Spy/{APP_VERSION}"})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    releases = json.load(response)
+                release = releases[0] if isinstance(releases, list) and releases else {}
+                latest = str(release.get("tag_name", "")).lstrip("v")
+                if latest and version_key(latest) > version_key(APP_VERSION):
+                    url = release.get("html_url", "https://github.com/linirare/adxray-spy/releases")
 
-                if not spy.is_logged_in():
-                    self._log("Need ADXRay login...")
-                    if not spy.wait_for_login():
-                        raise Exception("Login timeout")
-                    self._update_status(True)
+                    def notify():
+                        if messagebox.askyesno("发现新版本", f"当前版本：{APP_VERSION}\n最新版本：{latest}\n\n打开下载页面？"):
+                            webbrowser.open(url)
 
-                for i, game in enumerate(game_names, 1):
-                    self._log(f"\n{'─'*50}")
-                    self._log(f"[{i}/{total}] Processing: {game}")
-                    self._log(f"{'─'*50}")
-                    try:
-                        self._log(f"Searching: {game}")
-                        products = spy.get_product_from_search(game)
-                        if not products:
-                            self._log(f"Game not found: {game}")
-                            results.append((game, "not found", None))
-                            continue
-
-                        ids = ", ".join(p["id"] for p in (products if isinstance(products, list) else [products]))
-                        self._log(f"Target IDs: {ids}")
-
-                        data = spy.extract_all(products)
-
-                        output = Path(self.output_dir)
-                        output.mkdir(parents=True, exist_ok=True)
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        report_path = spy.generate_report(
-                            data, str(output / f"{game}_{ts}_report.txt"))
-
-                        self._log(f"Done! Report: {report_path}")
-                        results.append((game, "ok", report_path))
-                    except Exception as e:
-                        self._log(f"Error processing '{game}': {e}")
-                        results.append((game, "error", str(e)))
-
-                # Summary
-                ok_count = sum(1 for r in results if r[1] == "ok")
-                self._log(f"\n{'='*50}")
-                self._log(f"All done! {ok_count}/{total} succeeded")
-                self._log(f"{'='*50}")
-                ok_paths = [r[2] for r in results if r[1] == "ok"]
-                fail_names = [r[0] for r in results if r[1] != "ok"]
-                msg = f"Complete! {ok_count}/{total} succeeded\n"
-                if ok_paths:
-                    msg += f"\nReports:\n" + "\n".join(ok_paths)
-                if fail_names:
-                    msg += f"\n\nFailed: {', '.join(fail_names)}"
-                messagebox.showinfo("Summary", msg)
-
-            except Exception as e:
-                self._log(f"Error: {e}")
-                messagebox.showerror("Error", str(e))
-            finally:
-                if self.spy:
-                    self.spy.close()
-                    self.spy = None
-                self.run_btn.config(state="normal", text="Start Extract")
+                    self._post_ui(notify)
+            except Exception:
+                return
 
         threading.Thread(target=task, daemon=True).start()
 
     def _on_close(self):
-        if self.spy:
-            self.spy.close()
+        self.cancel_event.set()
         sys.stdout = sys.__stdout__
         self.window.destroy()
 
@@ -311,8 +428,20 @@ class ADXRaySpyGUI:
 
 
 def main():
-    app = ADXRaySpyGUI()
-    app.run()
+    if "--version" in sys.argv:
+        print(APP_VERSION)
+        return
+    if "--smoke-test" in sys.argv:
+        import openpyxl  # noqa: F401
+        import playwright  # noqa: F401
+        ensure_playwright_browsers()
+        spy = ADXRaySpy("release-smoke-test")
+        try:
+            spy.launch(headless=True)
+        finally:
+            spy.close()
+        return
+    ADXRaySpyGUI().run()
 
 
 if __name__ == "__main__":
