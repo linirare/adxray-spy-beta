@@ -268,7 +268,10 @@ class ADXRaySpy:
 
             body = self._active_panel_text()
 
-            # 否定检测：登录页特征
+            # 否定检测：密码输入框存在 → 登录页（最可靠指标）
+            password_input = self.page.locator("input[type='password']")
+            if password_input.count() > 0 and password_input.first.is_visible():
+                return False
             if "登录" in body and ("密码" in body or "验证码" in body):
                 return False
             if "记住密码" in body or "忘记密码" in body:
@@ -279,9 +282,10 @@ class ADXRaySpy:
             if search.count() > 0 and search.first.is_visible():
                 return True
 
-            # 肯定检测 2: 业务关键词 + 足够内容量
-            keywords = ["素材数", "总计划", "投放", "产品", "分析", "趋势"]
-            if any(k in body for k in keywords) and len(body) > 200:
+            # 肯定检测 2: 业务关键词（需至少命中 2 个，排除"产品"等泛词）
+            keywords = ["素材数", "总计划", "投放", "趋势"]
+            match_count = sum(1 for k in keywords if k in body)
+            if match_count >= 2 and len(body) > 200:
                 return True
 
             return False
