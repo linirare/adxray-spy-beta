@@ -14,7 +14,7 @@ ADXRay Spy 是一个不依赖大模型的 Windows 桌面工具。输入游戏名
 
 ## 下载与使用
 
-从 [GitHub Releases](https://github.com/linirare/adxray-spy/releases) 下载以下任一版本：
+从 [GitHub Releases](https://github.com/linirare/adxray-spy-beta/releases) 下载以下任一版本：
 
 - `adxray-spy-setup-win-x64.exe`：推荐给普通用户的安装器
 - `adxray-spy-portable-win-x64.zip`：解压后直接运行的便携版
@@ -98,4 +98,4 @@ GitHub Actions 会在推送 `v*` 标签时运行测试、构建 Windows 安装�
 
 ## 仓库说明
 
-正式应用和发布包仅包含 `adxray_spy_core.py` 与 `adxray_spy_gui.py`。仓库根目录中的 MediaCrawler 和特定数据分析脚本属于研究实验，不会进入安装器或便携版。
+本仓库为公开 Beta 版本，仅包含 `adxray_spy_core.py` 与 `adxray_spy_gui.py` 及构建所需文件。
