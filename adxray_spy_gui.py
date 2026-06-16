@@ -20,7 +20,7 @@ from adxray_spy_core import (  # noqa: E402
     ensure_playwright_browsers,
 )
 
-RELEASE_API = "https://api.github.com/repos/linirare/adxray-spy/releases?per_page=1"
+RELEASE_API = "https://api.github.com/repos/linirare/adxray-spy-beta/releases?per_page=1"
 
 
 def version_key(value):
@@ -408,7 +408,7 @@ class ADXRaySpyGUI:
                 release = releases[0] if isinstance(releases, list) and releases else {}
                 latest = str(release.get("tag_name", "")).lstrip("v")
                 if latest and version_key(latest) > version_key(APP_VERSION):
-                    url = release.get("html_url", "https://github.com/linirare/adxray-spy/releases")
+                    url = release.get("html_url", "https://github.com/linirare/adxray-spy-beta/releases")
 
                     def notify():
                         if messagebox.askyesno("发现新版本", f"当前版本：{APP_VERSION}\n最新版本：{latest}\n\n打开下载页面？"):

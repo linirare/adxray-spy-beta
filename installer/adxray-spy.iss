@@ -1,5 +1,5 @@
 #define MyAppName "ADXRay Spy"
-#define MyAppVersion "1.1.0-beta.2.2"
+#define MyAppVersion "1.1.0-beta.2.3"
 #define MyAppPublisher "linirare"
 #define MyAppExeName "adxray-spy.exe"
 
