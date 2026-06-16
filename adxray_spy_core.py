@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 ADXRAY_URL = "https://adxray.dataeye.com/index/home#/Product"
 SESSION_DIR = Path.home() / ".adxray_spy" / "browser_data"
 OUTPUT_DIR = Path.cwd() / "output"
-APP_VERSION = "1.1.0-beta.2.3"
+APP_VERSION = "1.1.0-beta.2.4"
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 SECRET_PATTERNS = [
@@ -296,10 +296,12 @@ class ADXRaySpy:
         return False
 
     def is_logged_in(self, navigate=True):
-        """判断 ADXRay 是否已登录。最多等待 ~15 秒让 SPA 完成 auth 跳转。"""
+        """判断 ADXRay 是否已登录。先等待 25 秒让 SPA 完成 auth 跳转再检测。"""
         try:
             if navigate:
                 self._goto(ADXRAY_URL)
+            # 等待 25 秒让 SPA 完成 auth 跳转，避免外壳渲染阶段搜索框导致误判
+            self.page.wait_for_timeout(25000)
             for _ in range(15):
                 self.page.wait_for_timeout(1000)
                 if self._is_login_page():
@@ -316,8 +318,8 @@ class ADXRaySpy:
         print("请在浏览器中登录 ADXRay（你有 5 分钟时间）...")
         if "adxray.dataeye.com" not in (self.page.url or ""):
             self._goto(ADXRAY_URL)
-        # 等待 SPA 完成初始 auth 跳转，避免外壳渲染阶段搜索框出现导致误判
-        self.page.wait_for_timeout(3000)
+        # 等待 25 秒让 SPA 完成 auth 跳转，避免外壳渲染阶段搜索框出现导致误判
+        self.page.wait_for_timeout(25000)
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             self._check_cancelled()
