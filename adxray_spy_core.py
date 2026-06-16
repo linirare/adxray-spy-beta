@@ -316,6 +316,8 @@ class ADXRaySpy:
         print("请在浏览器中登录 ADXRay（你有 5 分钟时间）...")
         if "adxray.dataeye.com" not in (self.page.url or ""):
             self._goto(ADXRAY_URL)
+        # 等待 SPA 完成初始 auth 跳转，避免外壳渲染阶段搜索框出现导致误判
+        self.page.wait_for_timeout(3000)
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             self._check_cancelled()
@@ -323,12 +325,7 @@ class ADXRaySpy:
                 if self.page.is_closed():
                     print("浏览器窗口已关闭")
                     return False
-                url = (self.page.url or "").lower()
-                if any(k in url for k in ("login", "signin", "auth", "passport")):
-                    time.sleep(2)
-                    continue
-                pw = self.page.locator("input[type='password']")
-                if pw.count() > 0 and pw.first.is_visible():
+                if self._is_login_page():
                     time.sleep(2)
                     continue
                 search = self.page.locator("input[placeholder*='搜索']")

@@ -151,7 +151,9 @@ class BetaBehaviorTests(unittest.TestCase):
                 return pw_loc
             if "placeholder*='搜索'" in sel:
                 return search_loc
-            return MagicMock()
+            empty = MagicMock()
+            empty.count.return_value = 0
+            return empty
 
         page.locator.side_effect = fake_locator
 
