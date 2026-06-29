@@ -35,7 +35,7 @@ class FakeSpy(ADXRaySpy):
         return [{"文案": "测试文案", "对应素材数": "3"}]
 
     def extract_creatives(self):
-        return {"类型分布": {"视频": "3"}}
+        return {"类型分布": {"视频": "3"}, "视频列表": []}
 
     def extract_influencer(self):
         return {}
@@ -195,6 +195,7 @@ class BetaBehaviorTests(unittest.TestCase):
                     "达人营销",
                     "投放趋势",
                     "素材链接",
+                    "视频详情",
                 ],
             )
             workbook.close()

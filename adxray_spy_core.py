@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 ADXRAY_URL = "https://adxray.dataeye.com/index/home#/Product"
 SESSION_DIR = Path.home() / ".adxray_spy" / "browser_data"
 OUTPUT_DIR = Path.cwd() / "output"
-APP_VERSION = "1.1.0-beta.2.4"
+APP_VERSION = "1.1.0-beta.2.5"
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 SECRET_PATTERNS = [
@@ -629,6 +629,65 @@ class ADXRaySpy:
                 return True
         return False
 
+    def _click_date_preset(self, days_text):
+        """点击日期快捷预设按钮（如 '30天'）"""
+        for sel in (
+            f"button:has-text('{days_text}')",
+            f"[class*='preset']:has-text('{days_text}')",
+            f".ant-picker-preset:has-text('{days_text}')",
+        ):
+            btn = self.page.locator(sel)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click()
+                self.page.wait_for_timeout(1000)
+                return True
+        return False
+
+    def _click_sort_column(self, column_text):
+        """点击表格列头排序（如 '计划使用数'）"""
+        for sel in (
+            f"th:has-text('{column_text}')",
+            f".ant-table-cell:has-text('{column_text}')",
+            "[class*='ant-table-column']:has-text('{column_text}')",
+        ):
+            header = self.page.locator(sel)
+            if header.count() > 0 and header.first.is_visible():
+                header.first.click()
+                self.page.wait_for_timeout(2000)
+                print(f"  已按'{column_text}'排序")
+                return True
+        print(f"  未找到排序列头: {column_text}")
+        return False
+
+    def _click_video_for_detail(self, row):
+        """点击行内视频/图片 → 弹窗提取全部详情 → 关闭弹窗"""
+        try:
+            video_el = row.locator("video, img, [class*='video'], [class*='thumbnail']")
+            if video_el.count() == 0 or not video_el.first.is_visible():
+                return {"视频链接": "", "详情": ""}
+            video_url = (video_el.get_attribute("src")
+                         or video_el.get_attribute("data-src")
+                         or "")
+            video_el.first.click()
+            self.page.wait_for_timeout(2000)
+            detail_text = ""
+            for msel in (".ant-modal-content", ".ant-drawer-body",
+                         "[class*='preview']", "[class*='video-detail']"):
+                modal = self.page.locator(msel)
+                if modal.count() > 0 and modal.first.is_visible():
+                    detail_text = modal.first.inner_text(timeout=3000)
+                    break
+            for csel in (".ant-modal-close", ".ant-drawer-close",
+                         "button:has-text('关闭')", "[class*='close']"):
+                btn = self.page.locator(csel)
+                if btn.count() > 0 and btn.first.is_visible():
+                    btn.first.click()
+                    self.page.wait_for_timeout(500)
+                    break
+            return {"视频链接": video_url, "详情": detail_text[:1000]}
+        except Exception:
+            return {"视频链接": "", "详情": ""}
+
     def extract_hot_copy(self):
         """提取热门文案 Top"""
         data = []
@@ -674,8 +733,11 @@ class ADXRaySpy:
         return data
 
     def extract_creatives(self):
-        """提取素材筛选 tab 的创意概览数据（多重 fallback）"""
-        data = {"类型分布": {}, "尺寸分布": {}, "广告形式": {}, "素材列表": [], "代表文案": []}
+        """提取素材筛选 tab：30天 → 按计划使用排序 → 表格统计 + 前100条视频详情"""
+        data = {
+            "类型分布": {}, "尺寸分布": {}, "广告形式": {},
+            "素材列表": [], "代表文案": [], "视频列表": [],
+        }
         try:
             # ── 切换 tab ──
             if not self._click_tab("素材筛选"):
@@ -683,9 +745,18 @@ class ADXRaySpy:
                 return data
             self.page.wait_for_timeout(3000)
 
-            # 滚动到底部触发懒加载
-            self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # ── 设置日期为 30 天 ──
+            self._click_date_preset("30天")
             self.page.wait_for_timeout(2000)
+
+            # ── 按最多计划使用排序 ──
+            self._click_sort_column("计划使用")
+            self.page.wait_for_timeout(2000)
+
+            # ── 多次滚动到底部触发懒加载，确保 100 条出现 ──
+            for _ in range(3):
+                self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                self.page.wait_for_timeout(2000)
             self.page.evaluate("window.scrollTo(0, 0)")
             self.page.wait_for_timeout(1000)
 
@@ -693,12 +764,14 @@ class ADXRaySpy:
             dbg = body[:300].replace("\n", " | ")
             print(f"  素材筛选页 body ({len(body)} chars): {dbg}...")
 
-            # 如果页面内容不含预期关键词，重试一次
+            # 如果页面内容过少，重试一次
             if "视频" not in body and "图片" not in body and len(body) < 200:
                 print("  页面内容过少，重试 tab 切换...")
                 self._click_tab("素材筛选")
                 self.page.wait_for_timeout(5000)
-                self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                self._click_date_preset("30天")
+                self.page.wait_for_timeout(2000)
+                self._click_sort_column("计划使用")
                 self.page.wait_for_timeout(2000)
                 body = self._active_panel_text()
                 dbg = body[:300].replace("\n", " | ")
@@ -706,21 +779,16 @@ class ADXRaySpy:
 
             lines = [l.strip() for l in body.split("\n") if l.strip()]
 
-            # ── 1) 素材类型分布 ──
-            # 方式A: 单行匹配 "视频 12345"
+            # ── 1) 素材类型分布（与原逻辑相同）──
             for line in lines:
                 m = re.match(r'^(视频|图片|playable|html5|试玩|图文)\s*(\d[\d,]*)\s*$', line, re.I)
                 if m:
                     data["类型分布"][m.group(1)] = m.group(2)
-
-            # 方式B: 全文搜索 "视频：12345组" / "视频 12,345"
             if not data["类型分布"]:
                 for kw in ["视频", "图片", "playable", "HTML5", "试玩", "图文"]:
                     m = re.search(rf'{re.escape(kw)}\s*[：:\s]*(\d[\d,.]*)\s*[组张条]?', body)
                     if m:
                         data["类型分布"][kw] = m.group(1)
-
-            # 方式C: 搜索 "视频 12,345" 后面跟数字的模式
             if not data["类型分布"]:
                 for m in re.finditer(r'(视频|图片)[^\d]*?(\d[\d,.]*)', body):
                     data["类型分布"][m.group(1)] = m.group(2)
@@ -736,33 +804,35 @@ class ADXRaySpy:
                 if m:
                     data["广告形式"][fmt] = m.group(1) if m.group(1) else "有"
 
-            # ── 4) 解析表格（多重 fallback） ──
-            table_selectors = [
-                ".ant-table-row, [class*='table-row'], tr.ant-table-row",
-                ".ant-table-tbody tr",
-                "table tbody tr",
-                "[class*='ant-table'] tbody tr",
-            ]
-            rows = []
-            for sel in table_selectors:
+            # ── 4) 解析表格（上限 100 行 + 每行提取视频详情）──
+            for sel in (".ant-table-row, [class*='table-row'], tr.ant-table-row",
+                        ".ant-table-tbody tr", "table tbody tr"):
                 rows = self.page.locator(sel).all()
                 if len(rows) > 0:
                     print(f"  表格选择器 '{sel}' 找到 {len(rows)} 行")
                     break
 
-            for row in rows[:40]:
+            for row in rows[:100]:
                 try:
                     cells = row.locator("td, .ant-table-cell").all()
                     cell_texts = [c.inner_text().strip() for c in cells if c.inner_text().strip()]
                     if cell_texts:
-                        data["素材列表"].append(cell_texts[:8])
+                        data["素材列表"].append(cell_texts[:10])
+
+                    # 点击视频缩略图获取详情
+                    detail = self._click_video_for_detail(row)
+                    data["视频列表"].append({
+                        "文本": (cell_texts[:3] if cell_texts else []),
+                        "视频链接": detail.get("视频链接", ""),
+                        "详情": detail.get("详情", ""),
+                    })
                 except Exception:
                     continue
 
             # ── 5) 代表文案 ──
             seen_texts = {}
-            for row in data["素材列表"]:
-                for cell in row:
+            for row_texts in data["素材列表"]:
+                for cell in row_texts:
                     if len(cell) > 8 and re.match(r'^[一-鿿]', cell):
                         seen_texts[cell] = seen_texts.get(cell, 0) + 1
             sorted_texts = sorted(seen_texts.items(), key=lambda x: -x[1])
@@ -773,10 +843,11 @@ class ADXRaySpy:
                 cands = [l for l in lines if len(l) > 12 and re.match(r'^[一-鿿]', l)]
                 data["代表文案"] = cands[:10]
 
+            video_count = sum(1 for v in data["视频列表"] if v["视频链接"])
             print(f"  创意: 类型={len(data['类型分布'])}种, "
                   f"广告形式={len(data['广告形式'])}种, "
                   f"表格={len(data['素材列表'])}行"
-                  + (f", 代表文案={len(data['代表文案'])}条" if data["代表文案"] else ""))
+                  + (f", 视频含链接={video_count}条" if video_count else ""))
 
         except Exception as e:
             self._module_error("素材创意", e)
@@ -1291,6 +1362,10 @@ class ADXRaySpy:
         links_ws = sheet("素材链接", ["类型", "链接", "文本", "来源页面"])
         for item in data.get("素材链接", []):
             links_ws.append([item.get(key, "") for key in ("类型", "链接", "文本", "来源页面")])
+
+        video_ws = sheet("视频详情", ["序号", "视频链接", "详情信息"])
+        for idx, v in enumerate(creatives.get("视频列表", []), 1):
+            video_ws.append([idx, v.get("视频链接", ""), v.get("详情", "")])
 
         for ws in workbook.worksheets:
             for column in ws.columns:
