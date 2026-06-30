@@ -352,16 +352,24 @@ class ADXRaySpyGUI:
                 game_step["offset"] = game_index * 7
                 self._log(f"\n开始处理: {game}")
                 try:
-                    product = spy.get_product_from_search(game, chooser=self._choose_product_from_worker)
-                    if not product:
+                    products = spy.search_game(game)
+                    if not products:
                         results.append((game, "失败", "未找到产品"))
                         continue
-                    data = spy.extract_all(product)
-                    outputs = spy.export_bundle(data, output_root)
-                    self.last_data = data
-                    status = data.get("抓取状态", {}).get("总体状态", "未知")
-                    results.append((game, status, outputs["directory"]))
-                    self._log(f"{game}: {status}，输出目录: {outputs['directory']}")
+                    if len(products) > 1:
+                        self._log(f"  找到 {len(products)} 个同名产品，自动依次提取...")
+                    for product in products:
+                        if self.cancel_event.is_set():
+                            raise ExtractionCancelled("用户已取消抓取")
+                        label = f"{game}_{product['id']}" if len(products) > 1 else game
+                        self._log(f"  提取产品: {label}")
+                        data = spy.extract_all(product)
+                        data["游戏名"] = label
+                        outputs = spy.export_bundle(data, output_root)
+                        self.last_data = data
+                        status = data.get("抓取状态", {}).get("总体状态", "未知")
+                        results.append((game, status, outputs["directory"]))
+                        self._log(f"  {label}: {status}，输出目录: {outputs['directory']}")
                 except ExtractionCancelled:
                     raise
                 except Exception as exc:

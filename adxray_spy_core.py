@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 ADXRAY_URL = "https://adxray.dataeye.com/index/home#/Product"
 SESSION_DIR = Path.home() / ".adxray_spy" / "browser_data"
 OUTPUT_DIR = Path.cwd() / "output"
-APP_VERSION = "1.1.0-beta.3"
+APP_VERSION = "1.1.0-beta.4"
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 SECRET_PATTERNS = [
