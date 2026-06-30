@@ -35,7 +35,7 @@ class FakeSpy(ADXRaySpy):
         return [{"文案": "测试文案", "对应素材数": "3"}]
 
     def extract_creatives(self):
-        return {"类型分布": {"视频": "3"}, "视频列表": []}
+        return {"类型分布": {"视频": "3"}, "素材详情": []}
 
     def extract_influencer(self):
         return {}
@@ -183,22 +183,17 @@ class BetaBehaviorTests(unittest.TestCase):
             self.assertTrue(excel_path.exists())
             self.assertEqual(report_path.parent, excel_path.parent)
             self.assertNotIn(":", report_path.parent.name)
-            workbook = load_workbook(excel_path, read_only=True)
-            self.assertEqual(
-                workbook.sheetnames,
-                [
-                    "抓取状态",
-                    "产品概览",
-                    "渠道分布",
-                    "热门文案",
-                    "素材创意",
-                    "达人营销",
-                    "投放趋势",
-                    "素材链接",
-                    "视频详情",
-                ],
-            )
-            workbook.close()
+            workbook = load_workbook(excel_path)
+            try:
+                self.assertEqual(
+                    workbook.sheetnames,
+                    [
+                        "汇总总览",
+                        "素材详情",
+                    ],
+                )
+            finally:
+                workbook.close()
 
     def test_generate_report_accepts_output_directory(self):
         data = FakeSpy().extract_all({"id": "123", "name": "测试", "url": "detail"})

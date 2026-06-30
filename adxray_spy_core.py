@@ -216,12 +216,13 @@ class ADXRaySpy:
             ".ant-tabs-tabpane-active",
             "[class*='tabpane'][class*='active']",
             ".ant-tabs-content .ant-tabs-tabpane:not([style*='display: none'])",
+            ".WBfDm",
             "main",
         ):
             try:
                 element = self.page.locator(selector).first
-                if element.is_visible(timeout=1000):
-                    text = element.inner_text(timeout=3000)
+                if element.count() > 0:
+                    text = element.inner_text(timeout=2000)
                     if text.strip():
                         return text
             except Exception:
@@ -621,72 +622,193 @@ class ADXRaySpy:
         return data
 
     def _click_tab(self, tab_text):
-        """点击指定名称的 tab"""
-        tabs = self.page.locator(".ant-tabs-tab")
-        for i in range(tabs.count()):
-            if tab_text in tabs.nth(i).inner_text():
-                tabs.nth(i).click()
-                return True
+        """点击指定名称的 tab，失败时用 JS dispatchEvent 重试"""
+        for attempt in range(2):
+            tabs = self.page.locator(".ant-tabs-tab")
+            for i in range(tabs.count()):
+                if tab_text in tabs.nth(i).inner_text():
+                    tabs.nth(i).click()
+                    self.page.wait_for_timeout(1000)
+                    return True
+            if attempt == 0:
+                # Fallback: use JS dispatchEvent for React synthetic events
+                self.page.evaluate(f"""() => {{
+                    let tabs = document.querySelectorAll('.ant-tabs-tab');
+                    for (let t of tabs) {{
+                        if (t.innerText.includes('{tab_text}')) {{
+                            t.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true}}));
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}""")
+                self.page.wait_for_timeout(2000)
         return False
 
     def _click_date_preset(self, days_text):
-        """点击日期快捷预设按钮（如 '30天'）"""
+        """点击日期快捷预设按钮（如 '30天'），需先点击日历图标展开"""
         for sel in (
             f"button:has-text('{days_text}')",
             f"[class*='preset']:has-text('{days_text}')",
             f".ant-picker-preset:has-text('{days_text}')",
+            f"[class*='quick']:has-text('{days_text}')",
         ):
             btn = self.page.locator(sel)
             if btn.count() > 0 and btn.first.is_visible():
                 btn.first.click()
                 self.page.wait_for_timeout(1000)
                 return True
+        # 点击日历图标展开日期选择面板
+        print(f"  未直接找到'{days_text}'按钮，尝试点击日历图标...")
+        calendar = self.page.locator(".anticon-calendar, [class*='calendar'], .ant-picker")
+        if calendar.count() > 0 and calendar.first.is_visible():
+            calendar.first.click(force=True)
+            self.page.wait_for_timeout(1500)
+            for sel in (
+                f"button:has-text('{days_text}')",
+                f"[class*='preset']:has-text('{days_text}')",
+                f".ant-picker-preset:has-text('{days_text}')",
+            ):
+                btn = self.page.locator(sel)
+                if btn.count() > 0 and btn.first.is_visible():
+                    btn.first.click()
+                    self.page.wait_for_timeout(1000)
+                    return True
         return False
 
     def _click_sort_column(self, column_text):
-        """点击表格列头排序（如 '计划使用数'）"""
-        for sel in (
-            f"th:has-text('{column_text}')",
-            f".ant-table-cell:has-text('{column_text}')",
-            "[class*='ant-table-column']:has-text('{column_text}')",
-        ):
-            header = self.page.locator(sel)
-            if header.count() > 0 and header.first.is_visible():
-                header.first.click()
-                self.page.wait_for_timeout(2000)
-                print(f"  已按'{column_text}'排序")
-                return True
+        """点击列头/筛选排序按钮。尝试多种列名变体。"""
+        variants = [column_text, f"{column_text}数", f"最多{column_text}", f"最多{column_text}数"]
+        for variant in variants:
+            for sel in (
+                f"th:has-text('{variant}')",
+                f".ant-table-cell:has-text('{variant}')",
+                "[class*='ant-table-column']:has-text('{variant}')",
+                f"[class*='sort']:has-text('{variant}')",
+                f"span:has-text('{variant}')",
+            ):
+                header = self.page.locator(sel)
+                if header.count() > 0 and header.first.is_visible():
+                    header.first.click()
+                    self.page.wait_for_timeout(2000)
+                    print(f"  已按'{variant}'排序")
+                    return True
         print(f"  未找到排序列头: {column_text}")
         return False
 
-    def _click_video_for_detail(self, row):
-        """点击行内视频/图片 → 弹窗提取全部详情 → 关闭弹窗"""
-        try:
-            video_el = row.locator("video, img, [class*='video'], [class*='thumbnail']")
-            if video_el.count() == 0 or not video_el.first.is_visible():
-                return {"视频链接": "", "详情": ""}
-            video_url = (video_el.get_attribute("src")
-                         or video_el.get_attribute("data-src")
-                         or "")
-            video_el.first.click()
-            self.page.wait_for_timeout(2000)
-            detail_text = ""
-            for msel in (".ant-modal-content", ".ant-drawer-body",
-                         "[class*='preview']", "[class*='video-detail']"):
-                modal = self.page.locator(msel)
-                if modal.count() > 0 and modal.first.is_visible():
-                    detail_text = modal.first.inner_text(timeout=3000)
-                    break
-            for csel in (".ant-modal-close", ".ant-drawer-close",
-                         "button:has-text('关闭')", "[class*='close']"):
-                btn = self.page.locator(csel)
-                if btn.count() > 0 and btn.first.is_visible():
-                    btn.first.click()
-                    self.page.wait_for_timeout(500)
-                    break
-            return {"视频链接": video_url, "详情": detail_text[:1000]}
-        except Exception:
-            return {"视频链接": "", "详情": ""}
+    @staticmethod
+    def _parse_material_detail(text):
+        """从素材详情弹窗文本中解析结构化字段。"""
+        detail = {
+            "媒体": "", "广告形式": "", "手机平台": "", "投放产品": "",
+            "素材文案": "", "投放账号": "", "原创地址": "",
+            "累计投放": "", "关联计划数": "", "新增计划数": "",
+            "今天": "", "昨天": "", "3天": "", "7天": "",
+            "预估转化量": "", "预估曝光量": "",
+            "素材尺寸": "", "投放周期": "",
+        }
+        field_names = sorted(detail.keys(), key=len, reverse=True)
+        for key in detail:
+            m = re.search(rf'{re.escape(key)}[：:]\s*([^\n]+)', text)
+            if m:
+                val = m.group(1).strip()
+                for fk in field_names:
+                    if fk != key and val.lstrip().startswith(fk):
+                        val = ""
+                        break
+                detail[key] = val
+        # Parse the time-distribution line: "今天：1 昨天：0 3天：1 7天：1"
+        td = re.search(r'今天[：:]\s*([\d.]+)\s*昨天[：:]\s*([\d.]+)\s*3天[：:]\s*([\d.]+)\s*7天[：:]\s*([\d.]+)', text)
+        if td:
+            detail["今天"] = td.group(1).strip()
+            detail["昨天"] = td.group(2).strip()
+            detail["3天"] = td.group(3).strip()
+            detail["7天"] = td.group(4).strip()
+        return detail
+
+    def _find_material_thumbnails(self):
+        """找出当前可见的素材缩略图列表（排除媒体图标）。"""
+        return self.page.evaluate("""() => {
+            let imgs = document.querySelectorAll('img');
+            let results = [];
+            for (let img of imgs) {
+                let rect = img.getBoundingClientRect();
+                if (rect.width < 100 || rect.height < 100) continue;
+                // Check if any parent has cursor:pointer (material items are clickable)
+                let parent = img.parentElement;
+                let clickable = false;
+                for (let i = 0; i < 5 && parent; i++) {
+                    if (window.getComputedStyle(parent).cursor === 'pointer') {
+                        clickable = true; break;
+                    }
+                    parent = parent.parentElement;
+                }
+                if (!clickable) continue;
+                results.push({
+                    src: img.src || '',
+                    rect: {x: rect.x, y: rect.y, w: rect.width, h: rect.height},
+                    naturalW: img.naturalWidth,
+                    naturalH: img.naturalHeight,
+                });
+            }
+            return results;
+        }""")
+
+    def _click_material_for_detail(self, thumb_info):
+        """点击素材缩略图 → 从弹窗提取全部详情 → 关闭弹窗"""
+        src = thumb_info.get("src", "")
+
+        for attempt in range(2):
+            try:
+                # Close any existing modal first
+                existing = self.page.locator(".ant-modal-content")
+                if existing.count() > 0 and existing.first.is_visible(timeout=1000):
+                    close_btn = self.page.locator(".ant-modal-close")
+                    if close_btn.count() > 0:
+                        close_btn.first.click()
+                        self.page.wait_for_timeout(800)
+
+                # Find img element and scroll into view for reliable coordinates
+                img = self.page.locator(f'img[src="{src}"]')
+                if img.count() == 0:
+                    return {"缩略图链接": src, "详情": ""}
+                img.first.evaluate("el => el.scrollIntoView({block: 'center'})")
+                self.page.wait_for_timeout(500)
+                box = img.first.bounding_box()
+                if not box:
+                    if attempt == 0:
+                        continue
+                    return {"缩略图链接": src, "详情": ""}
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+
+                # Click at center of thumbnail
+                self.page.mouse.click(cx, cy)
+                self.page.wait_for_timeout(2500)
+
+                # Wait for modal to appear
+                modal = self.page.locator(".ant-modal-content")
+                if modal.count() == 0 or not modal.first.is_visible(timeout=5000):
+                    if attempt == 0:
+                        continue
+                    return {"缩略图链接": src, "详情": ""}
+
+                detail_text = modal.first.inner_text(timeout=3000)
+                detail = self._parse_material_detail(detail_text)
+                detail["缩略图链接"] = src
+
+                # Close modal
+                close_btn = self.page.locator(".ant-modal-close")
+                if close_btn.count() > 0:
+                    close_btn.first.click()
+                    self.page.wait_for_timeout(800)
+
+                return detail
+            except Exception:
+                if attempt == 0:
+                    continue
+                return {"缩略图链接": src, "详情": ""}
+        return {"缩略图链接": src, "详情": ""}
 
     def extract_hot_copy(self):
         """提取热门文案 Top"""
@@ -733,12 +855,44 @@ class ADXRaySpy:
         return data
 
     def extract_creatives(self):
-        """提取素材筛选 tab：30天 → 按计划使用排序 → 表格统计 + 前100条视频详情"""
+        """提取素材筛选 tab：30天 → 排序 → 统计 → 逐个点开素材详情"""
         data = {
             "类型分布": {}, "尺寸分布": {}, "广告形式": {},
-            "素材列表": [], "代表文案": [], "视频列表": [],
+            "素材列表": [], "代表文案": [], "素材详情": [],
         }
         try:
+            # ── 先拦截 searchMaterial API（获取视频地址）──
+            api_material_data = {}  # pic_base -> {video_url, share_url, ...}
+
+            def capture_api(route):
+                if "material/searchMaterial" in route.request.url:
+                    try:
+                        resp = route.fetch()
+                        body = resp.body().decode("utf-8", errors="replace")
+                        root = json.loads(body)
+                        for item in root.get("content", {}).get("searchList", []):
+                            pics = item.get("picList") or []
+                            base = pics[0].split("?")[0] if pics else None
+                            if base:
+                                api_material_data[base] = {
+                                    "视频链接": (item.get("videoList") or [None])[0] or "",
+                                    "分享链接": item.get("shareUrl") or "",
+                                    "视频时长(ms)": item.get("durationMillis") or "",
+                                    "素材宽": item.get("materialWidth") or "",
+                                    "素材高": item.get("materialHigh") or "",
+                                    "达人昵称": ((item.get("nativeAdList") or [{}])[0].get("nickname") or ""),
+                                    "抖音账号": ((item.get("nativeAdList") or [{}])[0].get("dyAccount") or ""),
+                                    "媒体平台": ", ".join(m.get("mediaName", "") for m in (item.get("medias") or [])),
+                                }
+                    except Exception:
+                        pass
+                    finally:
+                        route.fulfill(response=resp)
+                else:
+                    route.continue_()
+
+            self.page.route("**/material/searchMaterial**", capture_api)
+
             # ── 切换 tab ──
             if not self._click_tab("素材筛选"):
                 print("  警告: 未找到素材筛选 tab")
@@ -750,45 +904,19 @@ class ADXRaySpy:
             self.page.wait_for_timeout(2000)
 
             # ── 按最多计划使用排序 ──
-            self._click_sort_column("计划使用")
+            self._click_sort_column("最多计划使用")
             self.page.wait_for_timeout(2000)
 
-            # ── 多次滚动到底部触发懒加载，确保 100 条出现 ──
-            for _ in range(3):
-                self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                self.page.wait_for_timeout(2000)
-            self.page.evaluate("window.scrollTo(0, 0)")
-            self.page.wait_for_timeout(1000)
-
+            # ── 读取 body 概览文本 ──
             body = self._active_panel_text()
-            dbg = body[:300].replace("\n", " | ")
-            print(f"  素材筛选页 body ({len(body)} chars): {dbg}...")
-
-            # 如果页面内容过少，重试一次
-            if "视频" not in body and "图片" not in body and len(body) < 200:
-                print("  页面内容过少，重试 tab 切换...")
-                self._click_tab("素材筛选")
-                self.page.wait_for_timeout(5000)
-                self._click_date_preset("30天")
-                self.page.wait_for_timeout(2000)
-                self._click_sort_column("计划使用")
-                self.page.wait_for_timeout(2000)
-                body = self._active_panel_text()
-                dbg = body[:300].replace("\n", " | ")
-                print(f"  重试后 body ({len(body)} chars): {dbg}...")
-
             lines = [l.strip() for l in body.split("\n") if l.strip()]
+            print(f"  素材筛选 body: {len(body)} chars, {len(lines)} lines")
 
-            # ── 1) 素材类型分布（与原逻辑相同）──
+            # ── 1) 素材类型分布 ──
             for line in lines:
                 m = re.match(r'^(视频|图片|playable|html5|试玩|图文)\s*(\d[\d,]*)\s*$', line, re.I)
                 if m:
                     data["类型分布"][m.group(1)] = m.group(2)
-            if not data["类型分布"]:
-                for kw in ["视频", "图片", "playable", "HTML5", "试玩", "图文"]:
-                    m = re.search(rf'{re.escape(kw)}\s*[：:\s]*(\d[\d,.]*)\s*[组张条]?', body)
-                    if m:
-                        data["类型分布"][kw] = m.group(1)
             if not data["类型分布"]:
                 for m in re.finditer(r'(视频|图片)[^\d]*?(\d[\d,.]*)', body):
                     data["类型分布"][m.group(1)] = m.group(2)
@@ -804,50 +932,80 @@ class ADXRaySpy:
                 if m:
                     data["广告形式"][fmt] = m.group(1) if m.group(1) else "有"
 
-            # ── 4) 解析表格（上限 100 行 + 每行提取视频详情）──
-            for sel in (".ant-table-row, [class*='table-row'], tr.ant-table-row",
-                        ".ant-table-tbody tr", "table tbody tr"):
-                rows = self.page.locator(sel).all()
-                if len(rows) > 0:
-                    print(f"  表格选择器 '{sel}' 找到 {len(rows)} 行")
+            # ── 4) 逐个点开素材缩略图获取详情 ──
+            max_items = 100
+            seen_srcs = set()
+            total_collected = 0
+
+            # 滚动加载 + 采集循环
+            for scroll_round in range(5):
+                # 找当前可见的缩略图
+                thumbs = self._find_material_thumbnails()
+                new_count = 0
+                for t in thumbs:
+                    src = t.get("src", "")
+                    if src in seen_srcs:
+                        continue
+                    seen_srcs.add(src)
+
+                    detail = self._click_material_for_detail(t)
+
+                    # ── 补充 API 数据（视频地址等）──
+                    if api_material_data:
+                        base = src.split("?")[0] if "?" in src else src
+                        api = api_material_data.get(base)
+                        if api:
+                            detail["视频链接"] = api.get("视频链接", "")
+                            detail["分享链接"] = api.get("分享链接", "")
+                            detail["视频时长(ms)"] = api.get("视频时长(ms)", "")
+                            detail["素材宽"] = api.get("素材宽", "")
+                            detail["素材高"] = api.get("素材高", "")
+                            detail["达人昵称"] = api.get("达人昵称", "")
+                            detail["抖音账号"] = api.get("抖音账号", "")
+                            detail["媒体平台"] = api.get("媒体平台", "")
+                        else:
+                            detail["视频链接"] = ""
+                            detail["分享链接"] = ""
+                    else:
+                        detail["视频链接"] = ""
+
+                    data["素材详情"].append(detail)
+                    new_count += 1
+                    total_collected += 1
+
+                    if total_collected % 10 == 0:
+                        print(f"  已提取 {total_collected} 条素材详情")
+
+                    if total_collected >= max_items:
+                        break
+
+                print(f"  第 {scroll_round + 1} 轮: 新增 {new_count} 条, 共 {total_collected} 条")
+                if total_collected >= max_items:
                     break
 
-            for row in rows[:100]:
-                try:
-                    cells = row.locator("td, .ant-table-cell").all()
-                    cell_texts = [c.inner_text().strip() for c in cells if c.inner_text().strip()]
-                    if cell_texts:
-                        data["素材列表"].append(cell_texts[:10])
+                # 滚动到底部加载更多
+                self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                self.page.wait_for_timeout(3000)
 
-                    # 点击视频缩略图获取详情
-                    detail = self._click_video_for_detail(row)
-                    data["视频列表"].append({
-                        "文本": (cell_texts[:3] if cell_texts else []),
-                        "视频链接": detail.get("视频链接", ""),
-                        "详情": detail.get("详情", ""),
-                    })
-                except Exception:
-                    continue
+            self.page.evaluate("window.scrollTo(0, 0)")
 
-            # ── 5) 代表文案 ──
-            seen_texts = {}
-            for row_texts in data["素材列表"]:
-                for cell in row_texts:
-                    if len(cell) > 8 and re.match(r'^[一-鿿]', cell):
-                        seen_texts[cell] = seen_texts.get(cell, 0) + 1
-            sorted_texts = sorted(seen_texts.items(), key=lambda x: -x[1])
+            # ── 5) 代表文案（从素材详情中提取）──
+            texts_seen = {}
+            for d in data["素材详情"]:
+                copy = d.get("素材文案", "").strip()
+                if len(copy) > 5:
+                    texts_seen[copy] = texts_seen.get(copy, 0) + 1
+            sorted_texts = sorted(texts_seen.items(), key=lambda x: -x[1])
             data["代表文案"] = [t for t, _ in sorted_texts[:10]]
 
-            # ── 6) 如果表格没取到，从 body 全文提取中文文案作为备选 ──
-            if not data["代表文案"] and len(lines) > 10:
+            if not data["代表文案"]:
                 cands = [l for l in lines if len(l) > 12 and re.match(r'^[一-鿿]', l)]
                 data["代表文案"] = cands[:10]
 
-            video_count = sum(1 for v in data["视频列表"] if v["视频链接"])
             print(f"  创意: 类型={len(data['类型分布'])}种, "
                   f"广告形式={len(data['广告形式'])}种, "
-                  f"表格={len(data['素材列表'])}行"
-                  + (f", 视频含链接={video_count}条" if video_count else ""))
+                  f"素材详情={len(data['素材详情'])}条"
+                  + (f", 代表文案={len(data['代表文案'])}条" if data['代表文案'] else ""))
 
         except Exception as e:
             self._module_error("素材创意", e)
@@ -1212,12 +1370,15 @@ class ADXRaySpy:
             p(f"  代表素材文案:")
             for t in cr["代表文案"][:8]:
                 p(f"    - \"{t[:60]}\"")
-        if cr.get("素材列表"):
+        if cr.get("素材详情"):
             p(f"")
-            p(f"  最近素材 ({len(cr['素材列表'])} 条):")
-            for idx, row in enumerate(cr["素材列表"][:10], 1):
-                p(f"    [{idx}] {'  |  '.join(row[:4])}")
-        if not cr.get("类型分布") and not cr.get("素材列表"):
+            p(f"  素材详情 ({len(cr['素材详情'])} 条):")
+            for idx, d in enumerate(cr["素材详情"][:5], 1):
+                copy = d.get("素材文案", "")[:30]
+                media = d.get("媒体", "")
+                p(f"    [{idx}] 文案=\"{copy}\" 媒体={media} 投放={d.get('累计投放','')}"
+                  f" 视频={'有' if d.get('视频链接') else ''}")
+        if not cr.get("类型分布") and not cr.get("素材详情"):
             p(f"  （素材筛选 tab 数据未提取到，ADXRay 页面可能未加载）")
 
         # ── 四、热门文案分析 ──
@@ -1299,7 +1460,7 @@ class ADXRaySpy:
         return str(output_path)
 
     def generate_excel(self, data, output_path):
-        """将抓取结果写入固定工作表结构的 Excel。"""
+        """将抓取结果写入 Excel：汇总总览 + 素材详情两个 sheet。"""
         from openpyxl import Workbook
         from openpyxl.styles import Font
 
@@ -1308,69 +1469,152 @@ class ADXRaySpy:
         workbook = Workbook()
         workbook.remove(workbook.active)
 
-        def sheet(name, headers):
-            ws = workbook.create_sheet(name)
-            ws.append(headers)
-            for cell in ws[1]:
-                cell.font = Font(bold=True)
-            ws.freeze_panes = "A2"
-            return ws
+        bold = Font(bold=True)
 
-        status_ws = sheet("抓取状态", ["模块", "状态", "错误", "来源页面", "抓取时间"])
+        def bold_row(ws, row_cells):
+            for cell in row_cells:
+                cell.font = bold
+
+        # ── Sheet 1: 汇总总览 ──
+        ws = workbook.create_sheet("汇总总览")
+
+        # 1) 抓取状态
+        ws.append(["【抓取状态】"])
+        bold_row(ws, ws[ws.max_row])
+        status_headers = ["模块", "状态", "错误", "来源页面", "抓取时间"]
+        ws.append(status_headers)
+        bold_row(ws, ws[ws.max_row])
         status = data.get("抓取状态", {})
-        status_ws.append(["总体", status.get("总体状态", "未知"), "", status.get("来源页面", ""), status.get("抓取时间", "")])
+        ws.append(["总体", status.get("总体状态", "未知"), "", status.get("来源页面", ""), status.get("抓取时间", "")])
         for item in status.get("模块", []):
-            status_ws.append([item.get(key, "") for key in ("模块", "状态", "错误", "来源页面", "抓取时间")])
+            ws.append([item.get(key, "") for key in ("模块", "状态", "错误", "来源页面", "抓取时间")])
+        ws.append([])
 
-        overview_ws = sheet("产品概览", ["字段", "值"])
+        # 2) 产品概览
+        ws.append(["【产品概览】"])
+        bold_row(ws, ws[ws.max_row])
+        ws.append(["字段", "值"])
+        bold_row(ws, ws[ws.max_row])
         for key, value in data.get("概览", {}).items():
-            overview_ws.append([key, "、".join(value) if isinstance(value, list) else value])
+            ws.append([key, "、".join(value) if isinstance(value, list) else value])
+        ws.append([])
 
-        channels_ws = sheet("渠道分布", ["类型", "名称", "归类"])
+        # 3) 渠道分布
+        ws.append(["【渠道分布】"])
+        bold_row(ws, ws[ws.max_row])
+        ws.append(["类型", "名称", "归类"])
+        bold_row(ws, ws[ws.max_row])
         channels = data.get("渠道分布", {})
         group_by_media = {}
         for group, members in channels.get("归类", {}).items():
             for member in members:
                 group_by_media[member] = group
         for media in channels.get("媒体", []):
-            channels_ws.append(["媒体", media, group_by_media.get(media, "")])
+            ws.append(["媒体", media, group_by_media.get(media, "")])
         for placement in channels.get("广告位", []):
-            channels_ws.append(["广告位", placement, ""])
+            ws.append(["广告位", placement, ""])
+        ws.append([])
 
-        copy_ws = sheet("热门文案", ["排名", "文案", "对应素材数", "使用天数", "产品使用数"])
+        # 4) 热门文案
+        ws.append(["【热门文案】"])
+        bold_row(ws, ws[ws.max_row])
+        ws.append(["排名", "文案", "对应素材数", "使用天数", "产品使用数"])
+        bold_row(ws, ws[ws.max_row])
         for index, item in enumerate(data.get("热门文案", []), 1):
-            copy_ws.append([index, item.get("文案", ""), item.get("对应素材数", ""), item.get("使用天数", ""), item.get("产品使用数", "")])
+            ws.append([index, item.get("文案", ""), item.get("对应素材数", ""),
+                       item.get("使用天数", ""), item.get("产品使用数", "")])
+        ws.append([])
 
-        creative_ws = sheet("素材创意", ["分类", "名称", "值"])
+        # 5) 素材创意
+        ws.append(["【素材创意】"])
+        bold_row(ws, ws[ws.max_row])
+        ws.append(["分类", "名称", "值"])
+        bold_row(ws, ws[ws.max_row])
         creatives = data.get("素材创意", {})
         for category in ("类型分布", "尺寸分布", "广告形式"):
             for key, value in creatives.get(category, {}).items():
-                creative_ws.append([category, key, value])
+                ws.append([category, key, value])
         for text in creatives.get("代表文案", []):
-            creative_ws.append(["代表文案", text, ""])
-        for row in creatives.get("素材列表", []):
-            creative_ws.append(["素材列表", " | ".join(row), ""])
+            ws.append(["代表文案", text, ""])
+        ws.append([])
 
-        influencer_ws = sheet("达人营销", ["字段", "值"])
+        # 6) 达人营销
+        ws.append(["【达人营销】"])
+        bold_row(ws, ws[ws.max_row])
+        ws.append(["字段", "值"])
+        bold_row(ws, ws[ws.max_row])
         for key, value in data.get("达人营销", {}).items():
-            influencer_ws.append([key, value])
+            ws.append([key, value])
+        ws.append([])
 
-        trends_ws = sheet("投放趋势", ["字段", "值"])
+        # 7) 投放趋势
+        ws.append(["【投放趋势】"])
+        bold_row(ws, ws[ws.max_row])
+        ws.append(["字段", "值"])
+        bold_row(ws, ws[ws.max_row])
         for key, value in data.get("投放趋势", {}).items():
-            trends_ws.append([key, value])
+            ws.append([key, value])
+        ws.append([])
 
-        links_ws = sheet("素材链接", ["类型", "链接", "文本", "来源页面"])
+        # 8) 素材链接
+        ws.append(["【素材链接】"])
+        bold_row(ws, ws[ws.max_row])
+        ws.append(["类型", "链接", "文本", "来源页面"])
+        bold_row(ws, ws[ws.max_row])
         for item in data.get("素材链接", []):
-            links_ws.append([item.get(key, "") for key in ("类型", "链接", "文本", "来源页面")])
+            ws.append([item.get(key, "") for key in ("类型", "链接", "文本", "来源页面")])
 
-        video_ws = sheet("视频详情", ["序号", "视频链接", "详情信息"])
-        for idx, v in enumerate(creatives.get("视频列表", []), 1):
-            video_ws.append([idx, v.get("视频链接", ""), v.get("详情", "")])
+        # 列宽自适应
+        for column in ws.columns:
+            max_length = max((len(str(cell.value or "")) for cell in column), default=10)
+            ws.column_dimensions[column[0].column_letter].width = min(max(max_length + 2, 12), 60)
 
-        for ws in workbook.worksheets:
-            for column in ws.columns:
-                max_length = max((len(str(cell.value or "")) for cell in column), default=10)
-                ws.column_dimensions[column[0].column_letter].width = min(max(max_length + 2, 12), 60)
+        # ── Sheet 2: 素材详情 ──
+        video_ws = workbook.create_sheet("素材详情")
+        video_ws.append([
+            "序号", "缩略图链接", "视频链接",
+            "媒体/广告位", "广告形式", "手机平台", "投放产品", "素材文案",
+            "投放账号", "原创地址",
+            "累计投放", "关联计划数", "新增计划数",
+            "今天", "昨天", "3天", "7天",
+            "预估转化量", "预估曝光量",
+            "素材尺寸", "投放周期",
+            "分享链接",
+        ])
+        for cell in video_ws[1]:
+            cell.font = bold
+        video_ws.freeze_panes = "A2"
+
+        for idx, v in enumerate(creatives.get("素材详情", []), 1):
+            video_ws.append([
+                idx,
+                v.get("缩略图链接", ""),
+                v.get("视频链接", ""),
+                v.get("媒体", ""),
+                v.get("广告形式", ""),
+                v.get("手机平台", ""),
+                v.get("投放产品", ""),
+                v.get("素材文案", ""),
+                v.get("投放账号", ""),
+                v.get("原创地址", ""),
+                v.get("累计投放", ""),
+                v.get("关联计划数", ""),
+                v.get("新增计划数", ""),
+                v.get("今天", ""),
+                v.get("昨天", ""),
+                v.get("3天", ""),
+                v.get("7天", ""),
+                v.get("预估转化量", ""),
+                v.get("预估曝光量", ""),
+                v.get("素材尺寸", ""),
+                v.get("投放周期", ""),
+                v.get("分享链接", ""),
+            ])
+
+        for column in video_ws.columns:
+            max_length = max((len(str(cell.value or "")) for cell in column), default=10)
+            video_ws.column_dimensions[column[0].column_letter].width = min(max(max_length + 2, 12), 60)
+
         workbook.save(output_path)
         print(f"Excel 已保存: {output_path}")
         return str(output_path)
@@ -1389,6 +1633,14 @@ class ADXRaySpy:
 # ----------------------------------------------------------------
 # 快捷入口
 # ----------------------------------------------------------------
+def _fix_console_encoding():
+    """修复 Windows 终端 GBK 编码无法输出 \xa0 等字符的问题。"""
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+
 def _choose_product_cli(products):
     for index, product in enumerate(products, 1):
         print(f"  [{index}] {product.get('name', '')} (ID={product.get('id', '?')})")
@@ -1404,7 +1656,8 @@ def _choose_product_cli(products):
 
 
 def run(game_name: str, session_name="adx", output_dir=None):
-    """完整流程：搜索 -> 提取 -> 文本报告和 Excel。"""
+    """完整流程：搜索 -> 提取（多产品自动遍历） -> 文本报告和 Excel。"""
+    _fix_console_encoding()
     ensure_playwright_browsers()
     spy = ADXRaySpy(session_name)
     try:
@@ -1420,17 +1673,30 @@ def run(game_name: str, session_name="adx", output_dir=None):
             if not spy.wait_for_login():
                 raise Exception("登录超时，请重试")
 
-        # 搜索游戏
-        product = spy.get_product_from_search(game_name, chooser=_choose_product_cli)
-        if not product:
+        # 搜索产品（获取所有匹配结果）
+        products = spy.search_game(game_name)
+        if not products:
             raise Exception(f"未找到游戏: {game_name}")
 
-        print(f"  目标产品: {product.get('name', game_name)} (ID={product.get('id', '?')})")
+        print(f"  找到 {len(products)} 个匹配产品:")
+        for p in products:
+            print(f"    ID={p['id']}")
 
-        # 提取数据
-        data = spy.extract_all(product)
+        all_results = []
+        for idx, product in enumerate(products):
+            label = f"{game_name}_{product['id']}" if len(products) > 1 else game_name
+            print(f"\n{'='*50}")
+            print(f"  正在提取 [{idx+1}/{len(products)}]: {label}")
+            print(f"{'='*50}")
 
-        return spy.export_bundle(data, output_dir)
+            data = spy.extract_all(product)
+            data["游戏名"] = label
+
+            result = spy.export_bundle(data, output_dir)
+            all_results.append(result)
+            print(f"  ✓ 完成: {result['directory']}")
+
+        return all_results if len(all_results) > 1 else all_results[0]
 
     finally:
         spy.close()
@@ -1438,6 +1704,7 @@ def run(game_name: str, session_name="adx", output_dir=None):
 
 def main_cli():
     """CLI 入口"""
+    _fix_console_encoding()
     import sys
     import argparse
 
