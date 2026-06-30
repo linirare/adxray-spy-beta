@@ -70,7 +70,7 @@ jobs:
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          gh release create $tag dist/release/* --prerelease --title $tag --notes "Public unsigned beta for Windows 10/11 x64.`n`nWindows SmartScreen may warn because this beta is not code-signed.`nVerify downloads with SHA256SUMS.txt before running." 2>$null
+          gh release create $tag dist/release/* --title $tag --notes "Public unsigned beta for Windows 10/11 x64.`n`nWindows SmartScreen may warn because this beta is not code-signed.`nVerify downloads with SHA256SUMS.txt before running." 2>$null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Release exists, updating..."
             gh release upload $tag dist/release/* --clobber
